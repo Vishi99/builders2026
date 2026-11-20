@@ -1,0 +1,33 @@
+# Local notes and macOS metadata
+/doc/
+.DS_Store
+
+# Python environments, bytecode, and tool caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Downloaded datasets, generator files, and run artifacts
+data/
+dev/
+dev-answer/
+output/
+out/
+scratch/
+*.parquet
+*.duckdb
+*.duckdb.wal
+generator/
+generate
+generator.zip
+dev-answer.zip
+starter-*.zip
+
+# Local credentials and environment overrides
+.aws/
+.env
+.env.*
+!.env.example
