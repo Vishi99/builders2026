@@ -3,32 +3,23 @@
 # no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
 FROM gcc:14-bookworm AS native-build
 ARG TARGETARCH
+ARG NATIVE_AMD64_ARCH=x86-64-v4
+# Set to 1 to reuse delimiter masks across event rows in the AVX-512 scanner.
+ARG NATIVE_ROLLING_AVX512=0
 WORKDIR /src
+RUN apt-get update && apt-get install -y --no-install-recommends liblz4-dev nlohmann-json3-dev \
+    && rm -rf /var/lib/apt/lists/*
 COPY starter-duckdb/pipeline/*.cpp starter-duckdb/pipeline/*.hpp ./
 RUN set -eu; \
-    cpu_flags=; \
-    if [ "$TARGETARCH" = amd64 ]; then cpu_flags=-march=x86-64-v3; fi; \
-    g++ -std=c++20 -O3 -DNDEBUG -flto -fPIC -shared -pthread $cpu_flags \
-        -static-libstdc++ -static-libgcc native_pipeline.cpp -o /shopping_native.so
+    set --; \
+    if [ "$TARGETARCH" = amd64 ]; then set -- "-march=$NATIVE_AMD64_ARCH"; fi; \
+    if [ "$NATIVE_ROLLING_AVX512" = 1 ]; then set -- "$@" -DSHOPPING_ROLLING_AVX512; fi; \
+    g++ -std=c++20 -O3 -DNDEBUG -flto -pthread "$@" \
+        -static-libstdc++ -static-libgcc native_pipeline.cpp native_main.cpp \
+        -Wl,-Bstatic -llz4 -Wl,-Bdynamic -o /shopping-sessions
 
-FROM python:3.12-slim-bookworm
-
-# The scorer runs the container as uid 1000; give that uid a name and a home.
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-
-COPY starter-duckdb/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-COPY starter-duckdb/pipeline/ /app/pipeline/
-COPY --from=native-build /shopping_native.so /app/pipeline/shopping_native.so
-COPY starter-duckdb/run.sh /app/run.sh
-RUN chmod +x /app/run.sh
-
-# At run time the root filesystem is read-only, the user is 1000:1000, there is
-# no network, /data is read-only, and /output and /scratch are the only writable
-# places. run.sh points every temp and cache directory at /scratch.
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-WORKDIR /app
-CMD ["/app/run.sh"]
+FROM debian:bookworm-slim
+COPY --from=native-build /shopping-sessions /usr/local/bin/shopping-sessions
+# The scorer mounts /data read-only and supplies a writable /output.
+USER 1000:1000
+CMD ["/usr/local/bin/shopping-sessions"]

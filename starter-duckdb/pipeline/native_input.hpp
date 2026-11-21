@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -21,6 +22,8 @@
 
 #if defined(__AVX2__) && defined(__BMI2__)
 #include <immintrin.h>
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
 #endif
 
 namespace input {
@@ -115,6 +118,110 @@ inline bool decode_row(const char* first, const char* last,
     }
     return find_byte(first, last, ',') == nullptr && decode_field(first, last, fields.back());
 }
+
+#if (defined(__AVX2__) && defined(__BMI2__)) || (defined(__aarch64__) && defined(__ARM_NEON))
+struct CsvMasks {
+    std::uint64_t newlines;
+    std::uint64_t commas;
+    std::uint64_t quotes;
+};
+
+#if defined(__AVX512BW__)
+inline constexpr std::size_t csv_block_bytes = 64;
+inline constexpr unsigned csv_mask_stride = 1;
+
+inline CsvMasks csv_masks(const char* block) noexcept {
+    const auto bytes = _mm512_loadu_si512(block);
+    return {_mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8('\n')),
+            _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8(',')),
+            _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8('"'))};
+}
+#elif defined(__AVX2__)
+inline constexpr std::size_t csv_block_bytes = 32;
+inline constexpr unsigned csv_mask_stride = 1;
+
+inline CsvMasks csv_masks(const char* block) noexcept {
+    const auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block));
+    auto match = [&](char ch) {
+        return static_cast<std::uint32_t>(_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(ch))));
+    };
+    return {match('\n'), match(','), match('"')};
+}
+#else
+inline constexpr std::size_t csv_block_bytes = 16;
+inline constexpr unsigned csv_mask_stride = 4;
+
+inline CsvMasks csv_masks(const char* block) noexcept {
+    static_assert(std::endian::native == std::endian::little);
+    const auto bytes = vld1q_u8(reinterpret_cast<const std::uint8_t*>(block));
+    auto match = [&](char ch) {
+        // Narrow each matching byte to a nibble and keep one bit per byte.
+        const auto pairs = vreinterpretq_u16_u8(vceqq_u8(bytes, vdupq_n_u8(ch)));
+        const auto packed = vshrn_n_u16(pairs, 4);
+        return vget_lane_u64(vreinterpret_u64_u8(packed), 0) & 0x1111111111111111ULL;
+    };
+    return {match('\n'), match(','), match('"')};
+}
+#endif
+
+#endif
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+// Locate the LF and validate CSV structure from the same vector loads.
+// Every comma separates fields, and wrapping quotes account for all quotes.
+template <std::size_t Width>
+inline bool read_vector_row(const char*& line, const char* last,
+                            std::array<std::string_view, Width>& fields) noexcept {
+    const char* row_start = line;
+    const char* first = line;
+    const char* block = line;
+    std::size_t column = 0;
+    std::size_t quote_count = 0;
+    std::size_t wrapped_fields = 0;
+
+    auto field = [&](const char* end) {
+        const bool wrapped = first < end && *first == '"';
+        if (wrapped && (end - first < 2 || end[-1] != '"')) {
+            return false;
+        }
+        wrapped_fields += wrapped;
+        fields[column++] = std::string_view(first + wrapped, end - first - 2 * wrapped);
+        first = end + 1;
+        return true;
+    };
+
+    for (; last - block >= static_cast<std::ptrdiff_t>(csv_block_bytes); block += csv_block_bytes) {
+        const auto masks = csv_masks(block);
+        const auto newline = masks.newlines & (0 - masks.newlines);
+        // An absent LF produces an all-ones mask after unsigned subtraction.
+        const auto before_lf = newline - 1;
+        quote_count += std::popcount(masks.quotes & before_lf);
+        auto commas = masks.commas & before_lf;
+        while (commas != 0) {
+            const auto* comma = block + std::countr_zero(commas) / csv_mask_stride;
+            if (column + 1 >= Width || !field(comma)) {
+                line = newline == 0 ? next_line(block + csv_block_bytes, last)
+                    : block + std::countr_zero(newline) / csv_mask_stride + 1;
+                return false;
+            }
+            commas &= commas - 1;
+        }
+        if (newline != 0) {
+            const auto* end = block + std::countr_zero(newline) / csv_mask_stride;
+            line = end + 1;
+            return end != row_start && column + 1 == Width && field(end) &&
+                   quote_count == 2 * wrapped_fields;
+        }
+    }
+
+    // At the map tail, avoid reading a vector across the end of the mapping.
+    const auto* newline = find_byte(block, last, '\n');
+    const auto* end = newline == nullptr ? last : newline;
+    line = newline == nullptr ? last : newline + 1;
+    return end != row_start && decode_row(row_start, end, fields);
+}
+#endif
 
 #if defined(__AVX2__) && defined(__BMI2__)
 // Use this decoder only when the map still has enough bytes for the last load.
@@ -242,11 +349,18 @@ struct BlockMasks {
 };
 
 inline BlockMasks classify_block(const char* base) noexcept {
+#if defined(__AVX512BW__)
+    const auto bytes = _mm512_loadu_si512(base);
+    return {_mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8('\n')),
+            _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8(',')),
+            _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8('"'))};
+#else
     const auto low = classify(base);
     const auto high = classify(base + 32);
     return {(std::uint64_t{high.newline} << 32) | low.newline,
             (std::uint64_t{high.comma} << 32) | low.comma,
             (std::uint64_t{high.quote} << 32) | low.quote};
+#endif
 }
 
 inline std::pair<std::uint64_t, std::uint64_t> row_bits(
@@ -317,13 +431,6 @@ const char* scan_rolling_events(const char* line, const char* limit, const char*
 }
 
 #if defined(__AVX512BW__)
-inline BlockMasks classify_event_block64(const char* line) noexcept {
-    const auto bytes = _mm512_loadu_si512(line);
-    return {_mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8('\n')),
-            _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8(',')),
-            _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8('"'))};
-}
-
 // Row ownership follows the first byte. The load guard uses the mapping end
 // because a range may own a row that continues after its scheduling boundary.
 template <typename Callback>
@@ -331,14 +438,14 @@ const char* scan_avx512_events(const char* line, const char* limit, const char* 
                               std::array<std::string_view, 7>& fields, Callback& callback) {
     constexpr unsigned block_bytes = 64;
     while (line < limit && last - line >= block_bytes) {
-        const auto first = classify_event_block64(line);
+        const auto first = classify_block(line);
         BlockMasks second{};
         unsigned length = std::countr_zero(first.newline);
         if (first.newline == 0) {
             if (last - line < 2 * block_bytes) {
                 break;
             }
-            second = classify_event_block64(line + block_bytes);
+            second = classify_block(line + block_bytes);
             length = block_bytes + std::countr_zero(second.newline);
         }
         if (length == 2 * block_bytes) {
@@ -437,17 +544,17 @@ inline constexpr auto calendar_months = make_calendar_months();
 }  // namespace detail
 
 // Byte ranges can be scanned concurrently. A range owns rows whose first byte
-// it contains, even if the row ends in the next range. Views borrow the map.
+// it contains, even if the row ends in the next range. Views borrow the input.
 template <std::size_t Width, typename Callback>
-void for_each_row(const MappedFile& file, std::size_t begin, std::size_t end, Callback&& callback) {
+void for_each_row_bytes(const char* data, std::size_t size, std::size_t begin,
+                        std::size_t end, Callback&& callback) {
     static_assert(Width > 0);
-    end = std::min(end, file.size());
+    end = std::min(end, size);
     if (begin >= end) {
         return;
     }
 
-    const char* const data = file.data();
-    const char* const last = data + file.size();
+    const char* const last = data + size;
     const char* const limit = data + end;
     const char* line = data + begin;
     if (begin == 0 || line[-1] != '\n') {
@@ -457,7 +564,7 @@ void for_each_row(const MappedFile& file, std::size_t begin, std::size_t end, Ca
     std::array<std::string_view, Width> fields;
 #if defined(__AVX2__) && defined(__BMI2__)
     if constexpr (Width == 7) {
-#if defined(__AVX512BW__)
+#if defined(__AVX512BW__) && !defined(SHOPPING_ROLLING_AVX512)
         line = detail::scan_avx512_events(line, limit, last, fields, callback);
 #else
         line = detail::scan_rolling_events(line, limit, last, fields, callback);
@@ -479,27 +586,136 @@ void for_each_row(const MappedFile& file, std::size_t begin, std::size_t end, Ca
             }
         }
 #endif
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        const bool valid = detail::read_vector_row(line, last, fields);
+#else
         const char* newline = detail::find_byte(line, last, '\n');
         const char* const line_end = newline == nullptr ? last : newline;
-        if (line != line_end) {
 #if defined(__AVX2__) && defined(__BMI2__)
-            const bool valid = last - line_end >= 31
-                ? detail::decode_padded_row(line, line_end, fields)
-                : detail::decode_row(line, line_end, fields);
+        const bool valid = line != line_end && (last - line_end >= 31
+            ? detail::decode_padded_row(line, line_end, fields)
+            : detail::decode_row(line, line_end, fields));
 #else
-            const bool valid = detail::decode_row(line, line_end, fields);
+        const bool valid = line != line_end && detail::decode_row(line, line_end, fields);
 #endif
-            if (valid) {
-                callback(std::as_const(fields));
-            }
-        }
         line = newline == nullptr ? last : newline + 1;
+#endif
+        if (valid) {
+            callback(std::as_const(fields));
+        }
     }
 }
 
 template <std::size_t Width, typename Callback>
 void for_each_row(const MappedFile& file, Callback&& callback) {
-    for_each_row<Width>(file, 0, file.size(), std::forward<Callback>(callback));
+    for_each_row_bytes<Width>(file.data(), file.size(), 0, file.size(),
+                             std::forward<Callback>(callback));
+}
+
+class BufferedFile {
+public:
+    explicit BufferedFile(const char* path) : fd_(open(path, O_RDONLY | O_CLOEXEC)) {
+        if (fd_ < 0) {
+            throw std::system_error(errno, std::generic_category(), path);
+        }
+        struct stat info {};
+        if (fstat(fd_, &info) != 0) {
+            const auto error = errno;
+            close(fd_);
+            throw std::system_error(error, std::generic_category(), path);
+        }
+        size_ = static_cast<std::size_t>(info.st_size);
+    }
+
+    BufferedFile(BufferedFile&& other) noexcept
+        : fd_(std::exchange(other.fd_, -1)), size_(other.size_) {}
+
+    ~BufferedFile() {
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+    // Workers share the descriptor. Explicit offsets let them read independently.
+    void read(char* destination, std::size_t offset, std::size_t count) const {
+        while (count != 0) {
+            const auto bytes = pread(fd_, destination, count, static_cast<off_t>(offset));
+            if (bytes < 0 && errno == EINTR) {
+                continue;
+            }
+            if (bytes < 0) {
+                throw std::system_error(errno, std::generic_category(), "pread CSV");
+            }
+            if (bytes == 0) {
+                throw std::runtime_error("Input shortened during CSV scan");
+            }
+            destination += bytes;
+            offset += bytes;
+            count -= bytes;
+        }
+    }
+
+private:
+    int fd_;
+    std::size_t size_;
+};
+
+class ChunkBuffer {
+public:
+    void reserve(std::size_t bytes, std::size_t retain = 0) {
+        if (bytes <= capacity_) {
+            return;
+        }
+        auto next = std::make_unique_for_overwrite<char[]>(bytes);
+        if (retain != 0) {
+            std::memcpy(next.get(), storage_.get(), retain);
+        }
+        storage_ = std::move(next);
+        capacity_ = bytes;
+    }
+
+    [[nodiscard]] char* data() const noexcept { return storage_.get(); }
+
+private:
+    std::unique_ptr<char[]> storage_;
+    std::size_t capacity_ = 0;
+};
+
+template <std::size_t Width, typename Callback>
+void for_each_row(const BufferedFile& file, ChunkBuffer& buffer, std::size_t begin,
+                  std::size_t end, Callback&& callback) {
+    // Read one preceding byte to distinguish a row start from a partial row.
+    const std::size_t first = begin != 0;
+    const std::size_t offset = begin - first;
+    const std::size_t owned_end = end - offset;
+    std::size_t loaded = std::min(file.size() - offset, owned_end + 4096);
+    buffer.reserve(loaded);
+    file.read(buffer.data(), offset, loaded);
+
+    if ((first == 0 || buffer.data()[0] != '\n') &&
+        std::memchr(buffer.data() + first, '\n', owned_end - first) == nullptr) {
+        // The chunk contains only a header or part of a row owned by another chunk.
+        return;
+    }
+
+    if (buffer.data()[owned_end - 1] != '\n' &&
+        std::memchr(buffer.data() + owned_end, '\n', loaded - owned_end) == nullptr) {
+        // A row that starts in this chunk belongs here through its trailing LF or EOF.
+        while (offset + loaded < file.size()) {
+            const auto extra = std::min(file.size() - offset - loaded, loaded);
+            buffer.reserve(loaded + extra, loaded);
+            file.read(buffer.data() + loaded, offset + loaded, extra);
+            const bool end_of_row = std::memchr(buffer.data() + loaded, '\n', extra) != nullptr;
+            loaded += extra;
+            if (end_of_row) {
+                break;
+            }
+        }
+    }
+    for_each_row_bytes<Width>(buffer.data(), loaded, first, owned_end,
+                             std::forward<Callback>(callback));
 }
 
 inline constexpr std::int64_t invalid_timestamp = std::numeric_limits<std::int64_t>::min();

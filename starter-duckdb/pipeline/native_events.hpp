@@ -4,6 +4,7 @@
 #include "native_sessions.hpp"
 
 #include <bit>
+#include <concepts>
 #include <memory>
 #include <type_traits>
 
@@ -95,8 +96,8 @@ struct EventTotals {
     std::vector<std::vector<UserDay>> days{partition_count};
 };
 
-template<class Time, class Person>
-EventRecord<Time> event_payload(const std::array<std::string_view, 7>& row, int64_t ingest,
+template<class Time, class Person, std::invocable<int64_t> IsLate>
+EventRecord<Time> event_payload(const std::array<std::string_view, 7>& row, IsLate&& is_late,
                                 int64_t start, int64_t end, int64_t time_base,
                                 const Products& products, Person&& person) {
     const bool purchase = row[4] == "purchase";
@@ -105,7 +106,7 @@ EventRecord<Time> event_payload(const std::array<std::string_view, 7>& row, int6
         return {};
     }
     const int64_t time = input::timestamp_ms(row[2]);
-    if (time < start || time >= end || time < ingest - day_ms) {
+    if (time < start || time >= end || is_late(time)) {
         return {};
     }
     const uint32_t price = purchase ? input::purchase_price(row[6]) : 0;
@@ -114,6 +115,14 @@ EventRecord<Time> event_payload(const std::array<std::string_view, 7>& row, int6
     }
     return EventRecord<Time>::encode(person(row[1]), time - time_base, price,
                                      purchase ? products.category(row[5]) : 0);
+}
+
+template<class Time, class Person>
+EventRecord<Time> event_payload(const std::array<std::string_view, 7>& row, int64_t ingest,
+                                int64_t start, int64_t end, int64_t time_base,
+                                const Products& products, Person&& person) {
+    return event_payload<Time>(row, [=](int64_t time) { return time < ingest - day_ms; },
+                               start, end, time_base, products, std::forward<Person>(person));
 }
 
 template<class Event>
@@ -215,12 +224,13 @@ void reserve_copies(const std::vector<input::MappedFile>& files, Partitioned<Cop
     size_t input_bytes = 0;
     size_t sample_bytes = 0;
     size_t sample_rows = 0;
+    constexpr size_t sample_limit = 65'536;
     for (const auto& file : files) {
         input_bytes += file.size();
         if (sample_rows >= 512 || file.size() <= 4096) {
             continue;
         }
-        const char* const end = file.data() + std::min<size_t>(file.size(), 65'536);
+        const char* const end = file.data() + std::min(file.size(), sample_limit);
         for (auto* line = input::detail::next_line(file.data(), end); line < end;) {
             const auto* newline = input::detail::find_byte(line, end, '\n');
             if (newline == nullptr) {

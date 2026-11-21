@@ -1,6 +1,6 @@
 # Shopping Sessions
 
-A native C++ pipeline that turns shopping events, ad clicks, and linked user IDs into two daily Parquet tables. PyArrow writes the output, and the original DuckDB pipeline is available for local cross-checks. See the [challenge brief](problem.txt) and [rules](rules.md) for the scorer contract.
+A native C++ pipeline that turns shopping events, ad clicks, and linked user IDs into two daily Parquet tables. The original DuckDB pipeline and a PyArrow writer are available for local cross-checks. See the [challenge brief](problem.txt) and [rules](rules.md) for the scorer contract.
 
 From the repository root, build the scorer image or run the bundled fixtures. The fixture checker requires Python with Polars.
 

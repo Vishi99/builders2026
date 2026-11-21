@@ -1,13 +1,13 @@
 # Shopping Sessions pipeline
 
-The scorer image resolves linked IDs, scans CSV shards in parallel, and builds sessions and campaign attribution in C++. PyArrow writes the two daily Parquet tables. The original DuckDB implementation is available for comparison.
+The scorer image runs a standalone C++ executable. It resolves linked IDs, scans CSV shards in parallel, builds sessions and campaign attribution, and writes the two daily Parquet tables. The original DuckDB implementation and the PyArrow writer are available for comparison.
 
 If this starter and `rules.md` ever disagree, `rules.md` wins. Ask the organizers if `rules.md` leaves you unsure.
 
 ## What to do first
 
 - Read `rules.md` for the full rules.
-- Start with `pipeline/native_runner.py` for the scorer entry point and `pipeline/native_pipeline.cpp` for the processing stages.
+- Start with `pipeline/native_main.cpp` for the scorer entrypoint and `pipeline/native_pipeline.cpp` for the processing stages.
 - Build the image and test against all 36 edge-case fixtures and the 1M-event dev set before submitting.
 
 ## Run and test locally
@@ -31,8 +31,29 @@ make check-dev                          # exact diff against dev-answer/, the tr
 
 If your laptop cannot spare 8 cores and 24 GB, run with lower limits using `make run-dev CPUS=4 MEM=8g`. Your local times will not match the scorer anyway; only the board's times count.
 
-- **x86 Linux and Windows machines.** Build and run the amd64 image natively.
+- **x86 Linux and Windows machines.** The default amd64 build targets `x86-64-v4` (AVX-512). Use `NATIVE_AMD64_ARCH=x86-64-v3` on a machine that supports AVX2 but lacks AVX-512.
 - **Apple-silicon Macs.** Emulating amd64 is slow. For fast local loops, build a native image with `make build run-dev PLATFORM=linux/arm64`. The Dockerfile pins no platform, so it builds either way. Check the amd64 image before you submit.
+
+To compare the AVX2 and AVX-512 builds on the same AVX-512-capable machine, build both images from the same source:
+
+```sh
+make build NATIVE_AMD64_ARCH=x86-64-v3 IMAGE=shopping-avx2
+make build NATIVE_AMD64_ARCH=x86-64-v4 IMAGE=shopping-avx512
+```
+
+The scorer builds from the submitted revision and uses that revision's Dockerfile default.
+
+The rolling AVX-512 option reuses delimiter masks across rows. The default
+uses the per-row AVX-512 scanner.
+To compare the two scanners on the same Xeon, build from the same source with:
+
+```sh
+make build NATIVE_ROLLING_AVX512=1 IMAGE=shopping-rolling
+make build NATIVE_ROLLING_AVX512=0 IMAGE=shopping-per-row
+```
+
+For a scorer comparison, submit two revisions that differ only in the
+`NATIVE_ROLLING_AVX512` default in the root Dockerfile.
 
 To iterate without Docker on Linux with a C++20 compiler:
 
@@ -67,8 +88,8 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 ## Common pitfalls
 
 - **CSV parsing.** The native scanner splits at physical LF boundaries and checks the field count and quote placement. It retains CR, NUL and spaces as field bytes.
-- **Memory.** The native pipeline maps the input CSV shards and keeps compact event and click records in memory. It releases each event partition after deduplication or sessionization.
-- **No extension downloads.** The container has no network at run time. The image builds the C++ library and installs PyArrow ahead of time.
+- **Memory.** Native workers read input shards into reusable buffers and keep compact event and click records in memory. The pipeline releases each event partition after deduplication or sessionization.
+- **Build dependencies.** The image builds the executable with LZ4 and nlohmann JSON. The executable needs no network at run time.
 - **`\d` is not `[0-9]`.** In several regex engines, including Rust's used by Polars, `\d` matches any Unicode digit. The rules mean ASCII digits only.
 - **Extra files in output folders.** `_SUCCESS` and other non-Parquet files in the output folders are ignored.
 

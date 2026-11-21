@@ -24,9 +24,21 @@ CREATE TEMP MACRO timestamp_ms(value) AS (
     END
 );
 
--- Choose the entire earliest copy by event ID before validating ANY of
--- its fields. A struct preserves null fields in the winning copy.
+-- Count with a narrow hash table first. Most IDs occur once and can pass
+-- through without storing a full event row in an aggregate.
+CREATE TEMP TABLE duplicate_event_ids AS
+SELECT event_id
+FROM raw_events
+GROUP BY event_id
+HAVING count(*) > 1;
+
+-- For repeated IDs, choose the entire earliest copy before validating any
+-- of its fields. A struct preserves null fields in the winning copy.
 CREATE TEMP TABLE dedup_events AS
+SELECT user_id, ts, ingest_ts, event_type, product_id, price_cents
+FROM raw_events
+ANTI JOIN duplicate_event_ids USING (event_id)
+UNION ALL
 SELECT unnest(arg_min(
            struct_pack(user_id := user_id, ts := ts, ingest_ts := ingest_ts,
                        event_type := event_type, product_id := product_id,
@@ -34,7 +46,9 @@ SELECT unnest(arg_min(
            ingest_ts
        ))
 FROM raw_events
+SEMI JOIN duplicate_event_ids USING (event_id)
 GROUP BY event_id;
+DROP TABLE duplicate_event_ids;
 DROP TABLE raw_events;
 
 CREATE TEMP TABLE clean_events AS
