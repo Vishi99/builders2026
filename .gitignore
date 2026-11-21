@@ -32,3 +32,6 @@ starter-*.zip
 .env
 .env.*
 !.env.example
+
+# Rust build outputs
+/target/

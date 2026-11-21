@@ -1,11 +1,6 @@
-# Send only the files used to build the scorer image.
 **
 !Dockerfile
-!starter-duckdb/
-!starter-duckdb/requirements.txt
-!starter-duckdb/run.sh
-!starter-duckdb/pipeline/
-!starter-duckdb/pipeline/*.py
-!starter-duckdb/pipeline/*.sql
-!starter-duckdb/pipeline/*.cpp
-!starter-duckdb/pipeline/*.hpp
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/*.rs

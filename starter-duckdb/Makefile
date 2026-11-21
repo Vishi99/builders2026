@@ -3,8 +3,7 @@ CPUS  ?= 8
 MEM   ?= 24g
 # The scorer's platform. PLATFORM=linux/arm64 builds and runs natively on an Apple-silicon Mac, for fast local loops.
 PLATFORM ?= linux/amd64
-NATIVE_AMD64_ARCH ?= x86-64-v4
-NATIVE_ROLLING_AVX512 ?= 0
+NATIVE_AMD64_ARCH ?= x86-64-v3
 DEV   ?= dev
 # In the monorepo the fixtures live two levels up; the published starter has its own copy.
 FIXTURES ?= $(if $(wildcard fixtures),fixtures,../../fixtures)
@@ -15,7 +14,7 @@ export IMAGE CPUS MEM PLATFORM
 ## Build the image for the scorer's platform, linux/amd64 (emulated on Apple silicon)
 build:
 	docker buildx build --platform $(PLATFORM) --build-arg NATIVE_AMD64_ARCH=$(NATIVE_AMD64_ARCH) \
-		--build-arg NATIVE_ROLLING_AVX512=$(NATIVE_ROLLING_AVX512) --load -t $(IMAGE) ..
+		--load -t $(IMAGE) ..
 
 ## Build the native library for running pipeline.py directly on Linux
 native: pipeline/shopping_native.so
