@@ -1,6 +1,6 @@
 # Shopping Sessions: DuckDB starter
 
-The pipeline loads the challenge CSV data, resolves linked IDs, and produces the user and campaign daily Parquet tables. Python handles the exact CSV dialect and identity graph. Arrow passes bounded batches to DuckDB, which runs the SQL transformations.
+The pipeline loads the challenge CSV data, resolves linked IDs, and produces the user and campaign daily Parquet tables. DuckDB scans event and click shards as raw lines and validates their fields in SQL. Python resolves linked IDs and handles shards that require exact byte parsing.
 
 If this starter and `rules.md` ever disagree, `rules.md` wins. Ask the organizers if `rules.md` leaves you unsure.
 
@@ -65,7 +65,7 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 
 ## Common pitfalls
 
-- **CSV parsing.** The input parser opens files in binary mode to preserve CR, validates quote placement and field counts, and normalizes both forms of empty fields to null.
+- **CSV parsing.** The native scanner reads one field per raw line, with quote handling disabled. SQL checks quote placement and field counts. Shards with CR or NUL use the binary Python parser and bounded Arrow batches.
 - **Memory.** `pipeline.py` sets `memory_limit` to 80% of `MEM_GB` and `temp_directory` under `/scratch`, so big joins and sorts spill to disk instead of getting the container killed.
 - **No extension downloads.** The container has no network at run time. Parquet and CSV are built into the wheel; anything else must be installed at build time.
 - **`\d` is not `[0-9]`.** In several regex engines, including Rust's used by Polars, `\d` matches any Unicode digit. The rules mean ASCII digits only.

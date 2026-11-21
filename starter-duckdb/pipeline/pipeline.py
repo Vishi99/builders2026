@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Load the challenge's CSV dialect, then run the DuckDB transformation."""
 import json
+import mmap
 import os
+import sys
 from itertools import islice
 from pathlib import Path
+from time import perf_counter
 
 import duckdb
 import pyarrow as pa
@@ -36,21 +39,84 @@ def csv_rows(paths, width):
                     yield tuple(row)
 
 
-def load_rows(db, table, columns, rows):
+def load_rows(db, table, columns, rows, *, append=False):
     """Load bounded Arrow batches without materializing the dataset in Python."""
-    definitions = ", ".join(f"{name} VARCHAR" for name in columns)
-    db.execute(f"CREATE TEMP TABLE {table} ({definitions})")
+    schema = pa.schema([(name, pa.string()) for name in columns])
     rows = iter(rows)
-    while batch := list(islice(rows, BATCH_ROWS)):
-        arrow_batch = pa.table(
-            [pa.array(values, type=pa.string()) for values in zip(*batch)],
-            names=list(columns),
-        )
-        db.register("input_batch", arrow_batch)
+
+    def batches():
+        while batch := list(islice(rows, BATCH_ROWS)):
+            yield pa.RecordBatch.from_arrays(
+                [pa.array(values, type=pa.string()) for values in zip(*batch)],
+                schema=schema,
+            )
+
+    # DuckDB consumes one stream, avoiding an INSERT and registration per batch.
+    with pa.RecordBatchReader.from_batches(schema, batches()) as reader:
+        db.register("input_batch", reader)
         try:
-            db.execute(f"INSERT INTO {table} SELECT * FROM input_batch")
+            destination = f"INSERT INTO {table}" if append else f"CREATE TEMP TABLE {table} AS"
+            db.execute(f"{destination} SELECT * FROM input_batch")
         finally:
             db.unregister("input_batch")
+
+
+def load_logs(db, table, columns, paths):
+    """Scan ordinary shards in DuckDB and retain exact parsing for exceptions."""
+    native_paths, exact_paths = [], []
+    for path in paths:
+        filename = str(path)
+        # DuckDB expands glob patterns even when a path is passed in a list.
+        if any(char in filename for char in "*?[]"):
+            exact_paths.append(path)
+            continue
+        with path.open("rb") as source:
+            if os.fstat(source.fileno()).st_size == 0:
+                continue
+            with mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+                # The native scanner treats CR as a line ending and uses NUL
+                # internally when the delimiter is empty.
+                if mapped.find(b"\r") >= 0 or mapped.find(b"\x00") >= 0:
+                    exact_paths.append(path)
+                else:
+                    native_paths.append(filename)
+
+    if native_paths:
+        # Scan one raw field per physical line. With the CSV quote state machine
+        # disabled, an unclosed quote cannot consume the following line.
+        # The regex checks the exact field count and whole-field quote syntax.
+        field = r'(?:[^",]*|"[^",]*")'
+        pattern = ",".join([field] * len(columns))
+        projection = ", ".join(
+            f"""nullif(CASE WHEN starts_with(fields[{index}], '"')
+                            THEN fields[{index}][2:-2]
+                            ELSE fields[{index}] END, '') AS {column}"""
+            for index, column in enumerate(columns, 1)
+        )
+        try:
+            db.execute(rf"""
+                CREATE TEMP TABLE {table} AS
+                SELECT {projection}
+                FROM (
+                    SELECT string_split(line, ',') AS fields
+                    FROM read_csv(
+                        ?, columns={{'line': 'VARCHAR'}}, auto_detect=false,
+                        delim='', quote='', escape='', new_line='\n',
+                        header=false, skip=1, hive_partitioning=false
+                    )
+                    WHERE regexp_full_match(line, ?)
+                )
+                WHERE fields[1] NOT IN ('', '""')
+            """, [native_paths, pattern])
+        except duckdb.InvalidInputException:
+            # A valid raw line may exceed the native scanner's line limit.
+            # The failed CREATE TABLE rolls back, so replay all native shards.
+            exact_paths.extend(Path(path) for path in native_paths)
+            native_paths.clear()
+
+    if exact_paths or not native_paths:
+        rows = (row for row in csv_rows(exact_paths, len(columns)) if row[0] is not None)
+        load_rows(db, table, columns, rows, append=bool(native_paths))
 
 
 def person_mapping(edges):
@@ -88,7 +154,15 @@ def person_mapping(edges):
             yield user, person
 
 
+def report_stage(name, started):
+    # Keep timing in the scorer's stderr logs, including completed stages if a later one fails.
+    finished = perf_counter()
+    print(f"{name}: {finished - started:.3f}s", file=sys.stderr, flush=True)
+    return finished
+
+
 def main():
+    started = perf_counter()
     data = Path(os.environ.get("DATA_DIR", "/data"))
     output = Path(os.environ.get("OUTPUT_DIR", "/output"))
     scratch = Path(os.environ.get("SCRATCH_DIR", "/scratch"))
@@ -115,15 +189,16 @@ def main():
                   csv_rows([data / "products.csv"], 2))
         load_rows(db, "campaigns", ("campaign_id", "channel"),
                   csv_rows([data / "campaigns.csv"], 2))
-        load_rows(db, "raw_events", EVENT_COLUMNS,
-                  (row for row in csv_rows((data / "events").glob("*.csv"), len(EVENT_COLUMNS))
-                   if row[0] is not None))
+        stage = report_stage("Setup, links, and dimensions", started)
+        load_logs(db, "raw_events", EVENT_COLUMNS, (data / "events").glob("*.csv"))
+        stage = report_stage("Load events", stage)
         db.execute(Path(__file__).with_name("events.sql").read_text())
+        stage = report_stage("Clean events and build sessions", stage)
 
-        load_rows(db, "raw_clicks", CLICK_COLUMNS,
-                  (row for row in csv_rows((data / "clicks").glob("*.csv"), len(CLICK_COLUMNS))
-                   if row[0] is not None))
+        load_logs(db, "raw_clicks", CLICK_COLUMNS, (data / "clicks").glob("*.csv"))
+        stage = report_stage("Load clicks", stage)
         db.execute(Path(__file__).with_name("attribution.sql").read_text())
+        stage = report_stage("Clean clicks and attribute sessions", stage)
 
         for table in ("user_daily", "campaign_daily"):
             folder = output / table
@@ -131,6 +206,8 @@ def main():
             staging = folder / ".part-0.parquet"
             db.execute(f"COPY {table} TO ? (FORMAT parquet)", [str(staging)])
             staging.replace(folder / "part-0.parquet")
+        report_stage("Write Parquet", stage)
+    report_stage("Total pipeline", started)
 
 
 if __name__ == "__main__":
