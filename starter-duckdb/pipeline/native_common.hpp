@@ -3,6 +3,7 @@
 #include "native_input.hpp"
 
 #include <atomic>
+#include <bit>
 #include <cstdio>
 #include <deque>
 #include <exception>
@@ -11,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -91,8 +93,8 @@ void parallel_for(size_t count, unsigned threads, Work&& work) {
     }
 }
 
-template<size_t Width, class OnRow>
-void scan_shards(const fs::path& folder, unsigned threads, OnRow&& on_row) {
+template<size_t Width, class OnRow, class Prepare = std::nullptr_t>
+void scan_shards(const fs::path& folder, unsigned threads, OnRow&& on_row, Prepare prepare = nullptr) {
     constexpr size_t chunk_bytes = 4 << 20;
     struct Chunk {
         size_t file, begin, end;
@@ -112,6 +114,9 @@ void scan_shards(const fs::path& folder, unsigned threads, OnRow&& on_row) {
         for (size_t begin = 0; begin < size; begin += chunk_bytes) {
             chunks.push_back({index, begin, std::min(size, begin + chunk_bytes)});
         }
+    }
+    if constexpr (!std::is_same_v<Prepare, std::nullptr_t>) {
+        prepare(files);
     }
     parallel_for(chunks.size(), threads, [&](size_t index, unsigned worker) {
         const auto [file, begin, end] = chunks[index];
@@ -217,22 +222,35 @@ class IdMap {
     };
 
 public:
-    uint64_t get(uint64_t key) const {
-        return entries_[slot(key)].value;
+    uint64_t get(uint64_t key, uint64_t hash) const {
+        return entries_[slot(key, hash)].value;
     }
 
-    void insert(uint64_t key, uint64_t value) {
+    void reserve(size_t count) {
+        entries_.resize(std::max<size_t>(16, std::bit_ceil(count + count / 2 + 1)));
+    }
+
+    template<class NewValue>
+    uint64_t get_or_insert(uint64_t key, NewValue&& make_value) {
+        const uint64_t hash = hash_id(key);
+        size_t index = slot(key, hash);
+        if (entries_[index].key != 0) {
+            return entries_[index].value;
+        }
         if ((size_ + 1) * 3 >= entries_.size() * 2) {
             auto old = std::move(entries_);
             entries_.resize(old.size() * 2);
             for (const auto& entry : old) {
                 if (entry.key != 0) {
-                    entries_[slot(entry.key)] = entry;
+                    entries_[slot(entry.key, hash_id(entry.key))] = entry;
                 }
             }
+            index = slot(key, hash);
         }
-        entries_[slot(key)] = {key, value};
+        const auto value = make_value();
+        entries_[index] = {key, value};
         ++size_;
+        return value;
     }
 
     template<class Resolve>
@@ -245,9 +263,9 @@ public:
     }
 
 private:
-    size_t slot(uint64_t key) const {
+    size_t slot(uint64_t key, uint64_t hash) const {
         const size_t mask = entries_.size() - 1;
-        size_t index = hash_id(key) & mask;
+        size_t index = hash & mask;
         while (entries_[index].key != 0 && entries_[index].key != key) {
             index = (index + 1) & mask;
         }
@@ -266,16 +284,36 @@ class Identities {
     };
 
 public:
-    Identities(const fs::path& links, const IdKeys& keys) : keys_(keys) {
-        std::vector<Node> nodes;
-        auto node_for = [&](uint64_t key) {
-            if (const auto stored = aliases_.get(key)) {
-                return static_cast<uint32_t>(stored - 1);
+    struct alignas(64) LookupCache {
+        struct Entry {
+            uint64_t key = 0;
+            uint64_t person = 0;
+        };
+        std::array<Entry, 512> entries;
+    };
+
+    Identities(const fs::path& links, const IdKeys& keys, unsigned threads) : keys_(keys) {
+        using Edge = std::pair<uint64_t, uint64_t>;
+        std::vector<std::vector<Edge>> edges(threads);
+        scan_shards<2>(links, threads, [&](const auto& row, unsigned worker) {
+            if (!row[0].empty() && !row[1].empty() && row[0] != row[1]) {
+                edges[worker].emplace_back(keys_.key(row[0]), keys_.key(row[1]));
             }
-            const auto at = static_cast<uint32_t>(nodes.size());
-            nodes.push_back({key, at, 1});
-            aliases_.insert(key, uint64_t{at} + 1);
-            return at;
+        });
+
+        size_t count = 0;
+        for (const auto& shard : edges) {
+            count += shard.size();
+        }
+        aliases_.reserve(count);
+        std::vector<Node> nodes;
+        nodes.reserve(count);
+        auto node_for = [&](uint64_t key) {
+            return static_cast<uint32_t>(aliases_.get_or_insert(key, [&] {
+                const auto at = static_cast<uint32_t>(nodes.size());
+                nodes.push_back({key, at, 1});
+                return uint64_t{at} + 1;
+            }) - 1);
         };
         auto root = [&](uint32_t at) {
             while (nodes[at].parent != at) {
@@ -285,34 +323,50 @@ public:
             return at;
         };
 
-        scan_shards<2>(links, 1, [&](const auto& row, unsigned) {
-            if (row[0].empty() || row[1].empty() || row[0] == row[1]) {
-                return;
+        for (const auto& shard : edges) {
+            for (const auto& [left, right] : shard) {
+                auto a = root(node_for(left));
+                auto b = root(node_for(right));
+                if (a == b) {
+                    continue;
+                }
+                if (nodes[a].size < nodes[b].size) {
+                    std::swap(a, b);
+                }
+                nodes[b].parent = a;
+                nodes[a].size += nodes[b].size;
+                if (keys_.less(nodes[b].minimum, nodes[a].minimum)) {
+                    nodes[a].minimum = nodes[b].minimum;
+                }
             }
-            auto a = root(node_for(keys_.key(row[0])));
-            auto b = root(node_for(keys_.key(row[1])));
-            if (a == b) {
-                return;
-            }
-            if (nodes[a].size < nodes[b].size) {
-                std::swap(a, b);
-            }
-            nodes[b].parent = a;
-            nodes[a].size += nodes[b].size;
-            if (keys_.less(nodes[b].minimum, nodes[a].minimum)) {
-                nodes[a].minimum = nodes[b].minimum;
-            }
-        });
-        aliases_.resolve_values([&](uint64_t index) { return nodes[root(index - 1)].minimum; });
+        }
+        for (size_t index = 0; index < nodes.size(); ++index) {
+            nodes[index].minimum = nodes[root(index)].minimum;
+        }
+        aliases_.resolve_values([&](uint64_t index) { return nodes[index - 1].minimum; });
     }
 
     uint64_t person(std::string_view user) const {
         const uint64_t key = keys_.key(user);
-        const uint64_t canonical = aliases_.get(key);
-        return canonical == 0 ? key : canonical;
+        return canonical_key(key, hash_id(key));
+    }
+
+    uint64_t person(std::string_view user, LookupCache& cache) const {
+        const uint64_t key = keys_.key(user);
+        const uint64_t hash = hash_id(key);
+        auto& entry = cache.entries[hash % cache.entries.size()];
+        if (entry.key != key) {
+            entry = {key, canonical_key(key, hash)};
+        }
+        return entry.person;
     }
 
 private:
+    uint64_t canonical_key(uint64_t key, uint64_t hash) const {
+        const uint64_t canonical = aliases_.get(key, hash);
+        return canonical == 0 ? key : canonical;
+    }
+
     const IdKeys& keys_;
     IdMap aliases_;
 };

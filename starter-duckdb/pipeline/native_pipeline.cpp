@@ -164,7 +164,7 @@ extern "C" shopping::Output* shopping_run(const char* data_dir, const char* wind
         auto result = std::make_unique<Output>();
         StageTimer timer;
         IdKeys user_keys;
-        const Identities identities(data / "links", user_keys);
+        const Identities identities(data / "links", user_keys, threads);
         const Products products(data / "products.csv");
         const Campaigns campaigns(data / "campaigns.csv");
         timer.report("Resolve identities and load dimensions");

@@ -9,14 +9,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-
 
 class Buffer(ct.Structure):
     _fields_ = [("address", ct.c_void_p), ("size", ct.c_int64)]
 
-    def arrow(self, owner, *, optional=False):
+    def arrow(self, pa, owner, *, optional=False):
         if self.size == 0:
             return None if optional else pa.py_buffer(b"")
         return pa.foreign_buffer(self.address, self.size, base=owner)
@@ -25,19 +22,19 @@ class Buffer(ct.Structure):
 class Column(ct.Structure):
     _fields_ = [("validity", Buffer), ("offsets", Buffer), ("values", Buffer)]
 
-    def arrow(self, kind, count, owner):
-        buffers = [self.validity.arrow(owner, optional=True)]
+    def arrow(self, pa, kind, count, owner):
+        buffers = [self.validity.arrow(pa, owner, optional=True)]
         if pa.types.is_large_string(kind):
-            buffers.append(self.offsets.arrow(owner))
-        buffers.append(self.values.arrow(owner))
+            buffers.append(self.offsets.arrow(pa, owner))
+        buffers.append(self.values.arrow(pa, owner))
         return pa.Array.from_buffers(kind, count, buffers)
 
 
 class Table(ct.Structure):
     _fields_ = [("rows", ct.c_int64), ("columns", Column * 7)]
 
-    def arrow(self, schema, owner):
-        arrays = [column.arrow(field.type, self.rows, owner)
+    def arrow(self, pa, schema, owner):
+        arrays = [column.arrow(pa, field.type, self.rows, owner)
                   for column, field in zip(self.columns, schema)]
         return pa.Table.from_arrays(arrays, schema=schema)
 
@@ -46,16 +43,21 @@ class Output(ct.Structure):
     _fields_ = [("users", Table), ("campaigns", Table)]
 
 
-USER_SCHEMA = pa.schema([
-    ("user_id", pa.large_string()), ("day", pa.date32()),
-    ("sessions", pa.uint32()), ("events", pa.uint32()),
-    ("revenue_cents", pa.int64()), ("top_category", pa.large_string()),
-])
-CAMPAIGN_SCHEMA = pa.schema([
-    ("campaign_id", pa.large_string()), ("channel", pa.large_string()), ("day", pa.date32()),
-    ("sessions", pa.int64()), ("purchasing_sessions", pa.int64()),
-    ("revenue_cents", pa.int64()), ("assisted_sessions", pa.int64()),
-])
+def load_parquet():
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    user_schema = pa.schema([
+        ("user_id", pa.large_string()), ("day", pa.date32()),
+        ("sessions", pa.uint32()), ("events", pa.uint32()),
+        ("revenue_cents", pa.int64()), ("top_category", pa.large_string()),
+    ])
+    campaign_schema = pa.schema([
+        ("campaign_id", pa.large_string()), ("channel", pa.large_string()), ("day", pa.date32()),
+        ("sessions", pa.int64()), ("purchasing_sessions", pa.int64()),
+        ("revenue_cents", pa.int64()), ("assisted_sessions", pa.int64()),
+    ])
+    return pa, pq, user_schema, campaign_schema
 
 
 @contextmanager
@@ -80,17 +82,20 @@ def native_result(library, data, manifest, threads):
         native.shopping_free(owner)
 
 
-def write_table(table, path, threads=1):
+def write_table(pq, table, path, threads=1):
     path.mkdir(parents=True, exist_ok=True)
     parts = max(1, min(threads, table.num_rows // 262_144))
     length = (table.num_rows + parts - 1) // parts
     names = ["part-0.parquet", *(f"part-native-{i}.parquet" for i in range(1, parts))]
+    # These columns have many distinct values, so let Snappy compress them directly.
+    dictionary_columns = [name for name in table.column_names
+                          if name not in ("user_id", "revenue_cents")]
     with TemporaryDirectory(prefix=".parquet-", dir=path) as staging:
         staging = Path(staging)
 
         def write(index):
             pq.write_table(table.slice(index * length, length), staging / names[index],
-                           compression="snappy", row_group_size=122_880)
+                           compression="snappy", use_dictionary=dictionary_columns, row_group_size=122_880)
 
         if parts == 1:
             write(0)
@@ -116,10 +121,16 @@ def main(library):
         raise ValueError("NCPU must be positive")
     manifest = json.loads((data / "manifest.json").read_text())
 
-    # Each synchronous write finishes before the native buffers are freed.
-    with native_result(library, data, manifest, threads) as output:
-        write_table(output.users.arrow(USER_SCHEMA, output), destination / "user_daily", threads)
-        write_table(output.campaigns.arrow(CAMPAIGN_SCHEMA, output), destination / "campaign_daily")
+    # CDLL releases the GIL while the native code processes the inputs.
+    with ThreadPoolExecutor(max_workers=1) as startup:
+        writer = startup.submit(load_parquet)
+        # Finish both synchronous writes while the native buffers are alive.
+        with native_result(library, data, manifest, threads) as output:
+            pa, pq, user_schema, campaign_schema = writer.result()
+            write_table(pq, output.users.arrow(pa, user_schema, output),
+                        destination / "user_daily", threads)
+            write_table(pq, output.campaigns.arrow(pa, campaign_schema, output),
+                        destination / "campaign_daily")
 
     print(f"Total native pipeline: {perf_counter() - started:.3f}s", file=sys.stderr)
 

@@ -128,14 +128,12 @@ inline bool decode_padded_row(const char* first, const char* last,
     std::size_t quote_count = 0;
     std::size_t wrapped_fields = 0;
     auto field = [&](const char* end) {
-        const bool wrapped = first < end && *first == '"';
-        if (wrapped && (end - first < 2 || end[-1] != '"')) {
-            return false;
-        }
+        const auto length = end - first;
+        // Rows follow a header, so even a leading empty field has a preceding byte.
+        const bool wrapped = (length >= 2) & (*first == '"') & (end[-1] == '"');
         wrapped_fields += wrapped;
-        fields[column++] = std::string_view(first + wrapped, end - first - 2 * wrapped);
+        fields[column++] = std::string_view(first + wrapped, length - 2 * wrapped);
         first = end + 1;
-        return true;
     };
     for (const char* block = first; block < last;) {
         const auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block));
@@ -146,14 +144,19 @@ inline bool decode_padded_row(const char* first, const char* last,
             static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, comma_bytes))), size);
         quote_count += std::popcount(quotes);
         while (commas != 0) {
-            if (column + 1 >= Width || !field(block + std::countr_zero(commas))) {
+            if (column + 1 >= Width) {
                 return false;
             }
+            field(block + std::countr_zero(commas));
             commas &= commas - 1;
         }
         block += size;
     }
-    return column + 1 == Width && field(last) && quote_count == 2 * wrapped_fields;
+    if (column + 1 != Width) {
+        return false;
+    }
+    field(last);
+    return quote_count == 2 * wrapped_fields;
 }
 #endif
 
@@ -173,6 +176,29 @@ inline int decimal_pair(const char* value) noexcept {
     const unsigned second = static_cast<unsigned char>(value[1]) - '0';
     return first <= 9 && second <= 9 ? static_cast<int>(first * 10 + second) : -1;
 }
+
+struct CalendarMonth {
+    int first_day;
+    int length;
+};
+
+constexpr auto make_calendar_months() {
+    using namespace std::chrono;
+    std::array<std::array<CalendarMonth, 12>, 400> months{};
+    for (int y = 0; y < 400; ++y) {
+        for (unsigned m = 1; m <= 12; ++m) {
+            const auto month_start = year(y) / month(m);
+            months[y][m - 1] = {
+                static_cast<int>(sys_days(month_start / 1).time_since_epoch().count()),
+                static_cast<int>(static_cast<unsigned>((month_start / last).day()))
+            };
+        }
+    }
+    return months;
+}
+
+// A Gregorian cycle has 400 years and exactly 146,097 days.
+inline constexpr auto calendar_months = make_calendar_months();
 
 }  // namespace detail
 
@@ -263,17 +289,13 @@ inline std::int64_t timestamp_ms(std::string_view value) noexcept {
     const int minute = detail::decimal_pair(text + 14);
 #endif
     const int second = detail::decimal_pair(text + 17);
-    if (century < 0 || year_in_century < 0 || month < 1 || day < 1 ||
+    if (century < 0 || year_in_century < 0 || month < 1 || month > 12 || day < 1 ||
         static_cast<unsigned>(hour) > 23 || static_cast<unsigned>(minute) > 59 ||
         static_cast<unsigned>(second) > 59) {
         return invalid_timestamp;
     }
-    const std::chrono::year_month_day civil{
-        std::chrono::year(century * 100 + year_in_century),
-        std::chrono::month(static_cast<unsigned>(month)),
-        std::chrono::day(static_cast<unsigned>(day)),
-    };
-    if (!civil.ok()) {
+    const auto& calendar = detail::calendar_months[(century % 4) * 100 + year_in_century][month - 1];
+    if (day > calendar.length) {
         return invalid_timestamp;
     }
     int offset_minutes = 0;
@@ -287,7 +309,7 @@ inline std::int64_t timestamp_ms(std::string_view value) noexcept {
         const int sign = value[19] == '+' ? 1 : -1;
         offset_minutes = sign * (offset_hour * 60 + offset_minute);
     }
-    const auto days = std::chrono::sys_days(civil).time_since_epoch().count();
+    const auto days = calendar.first_day + (century / 4) * 146'097 + day - 1;
     return static_cast<std::int64_t>(days) * 86'400'000 +
            ((hour * 60 + minute - offset_minutes) * 60 + second) * 1000;
 }

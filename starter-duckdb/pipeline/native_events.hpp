@@ -1,8 +1,15 @@
 #pragma once
 
 #include "native_common.hpp"
+#include "native_sessions.hpp"
 
 #include <bit>
+#include <memory>
+#include <type_traits>
+
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 namespace shopping {
 
@@ -58,13 +65,25 @@ struct Products {
     }
 };
 
-struct Event {
+template<class Time>
+struct EventRecord {
+    using Purchase = std::make_unsigned_t<Time>;
+    static constexpr unsigned price_bits = sizeof(Time) == 4 ? 24 : 32;
+    static constexpr Purchase price_mask = (Purchase{1} << price_bits) - 1;
+
     uint64_t person = 0;
-    int64_t timestamp = 0;
-    uint32_t price = 0;
-    uint32_t category = 0;
+    Time timestamp = 0;
+    Purchase purchase = 0;
+
+    uint32_t price() const { return purchase & price_mask; }
+    uint32_t category() const { return purchase >> price_bits; }
+
+    static EventRecord encode(uint64_t person, int64_t time, uint32_t price, uint32_t category) {
+        return {person, static_cast<Time>(time), (Purchase{category} << price_bits) | price};
+    }
 };
 
+template<class Event>
 struct EventCopy {
     uint64_t id;
     int64_t ingest;
@@ -76,53 +95,40 @@ struct EventTotals {
     std::vector<std::vector<UserDay>> days{partition_count};
 };
 
-inline void summarize_events(std::vector<Event>& events, size_t category_count,
-                             std::vector<Session>& sessions, std::vector<UserDay>& days) {
+template<class Event>
+void summarize_events(std::vector<Event>& events, int64_t time_base, size_t category_count,
+                      std::vector<Session>& sessions, std::vector<UserDay>& days) {
     std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) {
         return a.person < b.person || (a.person == b.person && a.timestamp < b.timestamp);
     });
 
-    std::vector<int64_t> category_revenue(category_count);
-    std::vector<uint32_t> purchased_categories;
+    CategoryRevenue category_revenue(category_count);
     size_t index = 0;
     while (index < events.size()) {
         const auto person = events[index].person;
-        const auto day = day_number(events[index].timestamp);
+        const auto day = day_number(time_base + events[index].timestamp);
         UserDay totals{person, 0, day, 0, 0, 0};
         do {
-            Session session{person, events[index].timestamp, 0};
+            Session session{person, time_base + events[index].timestamp, 0};
             const size_t begin = index;
             int64_t previous;
             do {
                 const Event& event = events[index++];
                 previous = event.timestamp;
-                if (event.price != 0) {
-                    session.revenue += event.price;
-                    auto& revenue = category_revenue[event.category];
-                    if (revenue == 0) {
-                        purchased_categories.push_back(event.category);
-                    }
-                    revenue += event.price;
+                if (const uint32_t price = event.price()) {
+                    session.revenue += price;
+                    category_revenue.add(event.category(), price);
                 }
             } while (index < events.size() && events[index].person == person &&
-                     events[index].timestamp - previous <= 1'800'000);
+                     events[index].timestamp - previous <= session_gap_ms);
             sessions.push_back(session);
             ++totals.sessions;
             totals.events += index - begin;
             totals.revenue += session.revenue;
         } while (index < events.size() && events[index].person == person &&
-                 day_number(events[index].timestamp) == day);
+                 day_number(time_base + events[index].timestamp) == day);
 
-        int64_t best_revenue = 0;
-        for (const uint32_t category : purchased_categories) {
-            auto& revenue = category_revenue[category];
-            if (revenue > best_revenue || (revenue == best_revenue && category < totals.category)) {
-                totals.category = category;
-                best_revenue = revenue;
-            }
-            revenue = 0;
-        }
-        purchased_categories.clear();
+        totals.category = category_revenue.winner();
         days.push_back(totals);
     }
 }
@@ -130,11 +136,114 @@ inline void summarize_events(std::vector<Event>& events, size_t category_count,
 template<class Record>
 using Partitioned = std::vector<std::array<std::vector<Record>, partition_count>>;
 
-inline EventTotals process_events(const fs::path& data, int64_t start, int64_t end,
+template<class Copy>
+class EventWinners {
+    static constexpr size_t group_size = 16;
+
+public:
+    explicit EventWinners(size_t count)
+        : tags_(std::max(group_size, std::bit_ceil(count + count / 2 + 1)), 0),
+          winners_(std::make_unique_for_overwrite<Copy*[]>(tags_.size())) {}
+
+    void choose(Copy& copy) {
+        const uint64_t hash = hash_id(copy.id);
+        const auto tag = static_cast<uint8_t>((hash >> 56) | 0x80);
+        const size_t mask = tags_.size() - 1;
+        size_t group = (hash & mask) & ~(group_size - 1);
+        for (;;) {
+            auto [matches, empty] = scan_group(tags_.data() + group, tag);
+            while (matches != 0) {
+                auto*& winner = winners_[group + std::countr_zero(matches)];
+                // Fingerprints filter probes. Full IDs determine equality.
+                if (winner->id == copy.id) {
+                    if (copy.ingest < winner->ingest) {
+                        winner->event.person = 0;
+                        winner = &copy;
+                    } else {
+                        copy.event.person = 0;
+                    }
+                    return;
+                }
+                matches &= matches - 1;
+            }
+            if (empty != 0) {
+                const size_t slot = group + std::countr_zero(empty);
+                tags_[slot] = tag;
+                winners_[slot] = &copy;
+                return;
+            }
+            group = (group + group_size) & mask;
+        }
+    }
+
+private:
+    static std::pair<unsigned, unsigned> scan_group(const uint8_t* tags, uint8_t tag) {
+#if defined(__SSE2__)
+        const auto group = _mm_loadu_si128(reinterpret_cast<const __m128i*>(tags));
+        return {static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(group, _mm_set1_epi8(tag)))),
+                static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(group, _mm_setzero_si128())))};
+#else
+        unsigned matches = 0;
+        unsigned empty = 0;
+        for (size_t index = 0; index < group_size; ++index) {
+            matches |= unsigned(tags[index] == tag) << index;
+            empty |= unsigned(tags[index] == 0) << index;
+        }
+        return {matches, empty};
+#endif
+    }
+
+    std::vector<uint8_t> tags_;
+    std::unique_ptr<Copy*[]> winners_;
+};
+
+template<class Copy>
+void reserve_copies(const std::vector<input::MappedFile>& files, Partitioned<Copy>& copies) {
+    size_t input_bytes = 0;
+    size_t sample_bytes = 0;
+    size_t sample_rows = 0;
+    for (const auto& file : files) {
+        input_bytes += file.size();
+        if (sample_rows >= 512 || file.size() <= 4096) {
+            continue;
+        }
+        const char* const end = file.data() + std::min<size_t>(file.size(), 65'536);
+        for (auto* line = input::detail::next_line(file.data(), end); line < end;) {
+            const auto* newline = input::detail::find_byte(line, end, '\n');
+            if (newline == nullptr) {
+                break;
+            }
+            sample_bytes += newline + 1 - line;
+            ++sample_rows;
+            line = newline + 1;
+        }
+    }
+    if (sample_rows == 0) {
+        return;
+    }
+
+    // This is only an allocation hint. Long rows and uneven shards can still
+    // make a bucket grow as usual.
+    const size_t row_bytes = std::max<size_t>(32, sample_bytes / sample_rows);
+    const size_t estimate = input_bytes / row_bytes / copies.size() / partition_count;
+    const size_t capacity = std::min<size_t>(32'768, estimate + estimate / 5);
+    for (auto& worker : copies) {
+        for (auto& bucket : worker) {
+            bucket.reserve(capacity);
+        }
+    }
+}
+
+template<class Time>
+EventTotals process_event_records(const fs::path& data, int64_t start, int64_t end,
                                   const Identities& identities, const Products& products,
                                   unsigned threads, StageTimer& timer) {
+    using Event = EventRecord<Time>;
+    using Copy = EventCopy<Event>;
+    const int64_t time_base = sizeof(Time) == 4 ? start : 0;
     IdKeys event_keys;
-    Partitioned<EventCopy> copies(threads);
+    Partitioned<Copy> copies(threads);
+    std::vector<Identities::LookupCache> people(threads);
     scan_shards<7>(data / "events", threads, [&](const auto& row, unsigned worker) {
         if (row[0].empty()) {
             return;
@@ -154,12 +263,14 @@ inline EventTotals process_events(const fs::path& data, int64_t start, int64_t e
             const uint32_t price = purchase ? input::purchase_price(row[6]) : 0;
             if (time >= start && time < end && time >= ingest - day_ms &&
                 (!purchase || price != 0)) {
-                event = {identities.person(row[1]), time, price,
-                         purchase ? products.category(row[5]) : 0};
+                event = Event::encode(identities.person(row[1], people[worker]), time - time_base, price,
+                                      purchase ? products.category(row[5]) : 0);
             }
         }
         // Even an invalid copy can win deduplication and suppress later copies.
         partition.push_back({id, ingest, event});
+    }, [&](const auto& files) {
+        reserve_copies(files, copies);
     });
     timer.report("Parse events");
 
@@ -172,37 +283,59 @@ inline EventTotals process_events(const fs::path& data, int64_t start, int64_t e
         if (count == 0) {
             return;
         }
-        const size_t capacity = std::bit_ceil(count + count / 2 + 1);
-        const size_t mask = capacity - 1;
-        std::vector<const EventCopy*> winners(capacity, nullptr);
-        for (const auto& source : copies) {
-            for (const auto& copy : source[bucket]) {
-                size_t slot = hash_id(copy.id) & mask;
-                while (winners[slot] != nullptr && winners[slot]->id != copy.id) {
-                    slot = (slot + 1) & mask;
-                }
-                if (winners[slot] == nullptr || copy.ingest < winners[slot]->ingest) {
-                    winners[slot] = &copy;
-                }
-            }
-        }
-        for (const EventCopy* winner : winners) {
-            if (winner != nullptr && winner->event.person != 0) {
-                by_person[worker][bucket_for_key(winner->event.person)].push_back(winner->event);
-            }
-        }
+        EventWinners<Copy> winners(count);
         for (auto& source : copies) {
-            std::vector<EventCopy>().swap(source[bucket]);
+            for (auto& copy : source[bucket]) {
+                winners.choose(copy);
+            }
+        }
+        // The table compares IDs and ingest times only. Marked losers can be
+        // skipped on a sequential pass over the source records.
+        for (auto& source : copies) {
+            for (const auto& copy : source[bucket]) {
+                if (copy.event.person != 0) {
+                    by_person[worker][bucket_for_key(copy.event.person)].push_back(copy.event);
+                }
+            }
+            std::vector<Copy>().swap(source[bucket]);
         }
     });
     timer.report("Deduplicate events");
 
-    EventTotals totals;
-    parallel_for(partition_count, threads, [&](size_t bucket, unsigned) {
-        size_t count = 0;
+    std::array<std::pair<size_t, size_t>, partition_count> work{};
+    for (size_t bucket = 0; bucket < partition_count; ++bucket) {
+        auto& [count, index] = work[bucket];
         for (const auto& source : by_person) {
             count += source[bucket].size();
         }
+        index = bucket;
+    }
+    // Start the largest partitions first to avoid leaving a hot user on the
+    // critical path after the smaller partitions have finished.
+    std::sort(work.begin(), work.end(), std::greater<>());
+
+    EventTotals totals;
+    parallel_for(partition_count, threads, [&](size_t task, unsigned) {
+        const auto [count, bucket] = work[task];
+        if (count == 0) {
+            return;
+        }
+        if constexpr (sizeof(Time) == 4) {
+            if (count < std::numeric_limits<uint32_t>::max()) {
+                session_bins::Bins bins(count);
+                for (auto& source : by_person) {
+                    auto& partition = source[bucket];
+                    for (const auto& event : partition) {
+                        bins.add(event.person, event.timestamp, event.price(), event.category());
+                    }
+                    std::vector<Event>().swap(partition);
+                }
+                session_bins::summarize(bins, time_base, products.categories.size(),
+                                        totals.sessions[bucket], totals.days[bucket]);
+                return;
+            }
+        }
+
         std::vector<Event> events;
         events.reserve(count);
         for (auto& source : by_person) {
@@ -210,11 +343,23 @@ inline EventTotals process_events(const fs::path& data, int64_t start, int64_t e
             events.insert(events.end(), partition.begin(), partition.end());
             std::vector<Event>().swap(partition);
         }
-        summarize_events(events, products.categories.size(), totals.sessions[bucket],
+        summarize_events(events, time_base, products.categories.size(), totals.sessions[bucket],
                          totals.days[bucket]);
     });
     timer.report("Build sessions and summarize user days");
     return totals;
+}
+
+inline EventTotals process_events(const fs::path& data, int64_t start, int64_t end,
+                                  const Identities& identities, const Products& products,
+                                  unsigned threads, StageTimer& timer) {
+    // Only select the compact layout when every timestamp and category can
+    // be represented exactly. The price limit fits in 24 bits in both cases.
+    const auto span = static_cast<uint64_t>(end) - static_cast<uint64_t>(start);
+    if (span <= (uint64_t{1} << 32) && products.categories.size() <= 256) {
+        return process_event_records<uint32_t>(data, start, end, identities, products, threads, timer);
+    }
+    return process_event_records<int64_t>(data, start, end, identities, products, threads, timer);
 }
 
 }  // namespace shopping
