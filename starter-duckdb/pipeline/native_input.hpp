@@ -158,6 +158,77 @@ inline bool decode_padded_row(const char* first, const char* last,
     field(last);
     return quote_count == 2 * wrapped_fields;
 }
+
+struct ByteMasks {
+    std::uint32_t newline, comma, quote;
+};
+
+inline ByteMasks classify(const char* position) noexcept {
+    const auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(position));
+    auto mask = [&](char byte) {
+        return static_cast<std::uint32_t>(
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(byte))));
+    };
+    return {mask('\n'), mask(','), mask('"')};
+}
+
+template <std::size_t Width>
+inline constexpr std::ptrdiff_t short_scan_bytes = Width == 7 ? 96 : 64;
+
+// The caller guarantees that the vector loads stay within the map. A missing
+// LF delegates the whole row to the generic decoder.
+template <std::size_t Width>
+inline const char* decode_short_row(const char* line, std::array<std::string_view, Width>& fields,
+                                    bool& valid) noexcept {
+    static_assert(Width == 4 || Width == 7);
+    const auto first = classify(line);
+    const auto second = classify(line + 32);
+    const auto newlines = (std::uint64_t{second.newline} << 32) | first.newline;
+    ByteMasks third{};
+    unsigned length = std::countr_zero(newlines);
+    if constexpr (Width == 7) {
+        third = classify(line + 64);
+        length = newlines != 0 ? length : 64 + std::countr_zero(third.newline);
+    }
+    if (length == short_scan_bytes<Width>) {
+        return nullptr;
+    }
+
+    valid = false;
+    const char* const last = line + length;
+    const unsigned tail = length > 64 ? length - 64 : 0;
+    auto commas = _bzhi_u64((std::uint64_t{second.comma} << 32) | first.comma, length);
+    auto late_commas = _bzhi_u32(third.comma, tail);
+    if (std::popcount(commas) + std::popcount(late_commas) != Width - 1) {
+        return last;
+    }
+    const auto quotes = _bzhi_u64((std::uint64_t{second.quote} << 32) | first.quote, length);
+    const auto late_quotes = _bzhi_u32(third.quote, tail);
+    const unsigned quote_count = std::popcount(quotes) + std::popcount(late_quotes);
+    unsigned wrapped_fields = 0;
+    const char* start = line;
+    auto field = [&](std::size_t column, const char* end) {
+        const auto size = end - start;
+        const bool wrapped = (size >= 2) & (*start == '"') & (end[-1] == '"');
+        wrapped_fields += wrapped;
+        fields[column] = std::string_view(start + wrapped, size - 2 * wrapped);
+        start = end + 1;
+    };
+    for (std::size_t column = 0; column < Width - 1; ++column) {
+        unsigned boundary;
+        if (commas != 0) {
+            boundary = std::countr_zero(commas);
+            commas &= commas - 1;
+        } else {
+            boundary = 64 + std::countr_zero(late_commas);
+            late_commas &= late_commas - 1;
+        }
+        field(column, line + boundary);
+    }
+    field(Width - 1, last);
+    valid = quote_count == 2 * wrapped_fields;
+    return last;
+}
 #endif
 
 template <typename Integer>
@@ -222,6 +293,20 @@ void for_each_row(const MappedFile& file, std::size_t begin, std::size_t end, Ca
 
     std::array<std::string_view, Width> fields;
     while (line < limit) {
+#if defined(__AVX2__) && defined(__BMI2__)
+        if constexpr (Width == 4 || Width == 7) {
+            if (last - line >= detail::short_scan_bytes<Width>) {
+                bool valid;
+                if (const char* newline = detail::decode_short_row(line, fields, valid)) {
+                    if (valid) {
+                        callback(std::as_const(fields));
+                    }
+                    line = newline + 1;
+                    continue;
+                }
+            }
+        }
+#endif
         const char* newline = detail::find_byte(line, last, '\n');
         const char* const line_end = newline == nullptr ? last : newline;
         if (line != line_end) {

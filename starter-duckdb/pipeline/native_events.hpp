@@ -95,6 +95,27 @@ struct EventTotals {
     std::vector<std::vector<UserDay>> days{partition_count};
 };
 
+template<class Time, class Person>
+EventRecord<Time> event_payload(const std::array<std::string_view, 7>& row, int64_t ingest,
+                                int64_t start, int64_t end, int64_t time_base,
+                                const Products& products, Person&& person) {
+    const bool purchase = row[4] == "purchase";
+    if (row[1].empty() || row[5].empty() ||
+        (!purchase && row[4] != "view" && row[4] != "cart")) {
+        return {};
+    }
+    const int64_t time = input::timestamp_ms(row[2]);
+    if (time < start || time >= end || time < ingest - day_ms) {
+        return {};
+    }
+    const uint32_t price = purchase ? input::purchase_price(row[6]) : 0;
+    if (purchase && price == 0) {
+        return {};
+    }
+    return EventRecord<Time>::encode(person(row[1]), time - time_base, price,
+                                     purchase ? products.category(row[5]) : 0);
+}
+
 template<class Event>
 void summarize_events(std::vector<Event>& events, int64_t time_base, size_t category_count,
                       std::vector<Session>& sessions, std::vector<UserDay>& days) {
@@ -136,41 +157,33 @@ void summarize_events(std::vector<Event>& events, int64_t time_base, size_t cate
 template<class Record>
 using Partitioned = std::vector<std::array<std::vector<Record>, partition_count>>;
 
-template<class Copy>
-class EventWinners {
+class EventWinnerSlots {
     static constexpr size_t group_size = 16;
 
 public:
-    explicit EventWinners(size_t count)
+    explicit EventWinnerSlots(size_t count)
         : tags_(std::max(group_size, std::bit_ceil(count + count / 2 + 1)), 0),
-          winners_(std::make_unique_for_overwrite<Copy*[]>(tags_.size())) {}
+          winners_(std::make_unique_for_overwrite<uintptr_t[]>(tags_.size())) {}
 
-    void choose(Copy& copy) {
-        const uint64_t hash = hash_id(copy.id);
+    template<class IsSameKey>
+    uintptr_t& find(uint64_t hash, IsSameKey&& same_key) {
         const auto tag = static_cast<uint8_t>((hash >> 56) | 0x80);
         const size_t mask = tags_.size() - 1;
         size_t group = (hash & mask) & ~(group_size - 1);
         for (;;) {
             auto [matches, empty] = scan_group(tags_.data() + group, tag);
             while (matches != 0) {
-                auto*& winner = winners_[group + std::countr_zero(matches)];
-                // Fingerprints filter probes. Full IDs determine equality.
-                if (winner->id == copy.id) {
-                    if (copy.ingest < winner->ingest) {
-                        winner->event.person = 0;
-                        winner = &copy;
-                    } else {
-                        copy.event.person = 0;
-                    }
-                    return;
+                auto& winner = winners_[group + std::countr_zero(matches)];
+                if (same_key(winner)) {
+                    return winner;
                 }
                 matches &= matches - 1;
             }
             if (empty != 0) {
                 const size_t slot = group + std::countr_zero(empty);
                 tags_[slot] = tag;
-                winners_[slot] = &copy;
-                return;
+                winners_[slot] = 0;
+                return winners_[slot];
             }
             group = (group + group_size) & mask;
         }
@@ -194,7 +207,7 @@ private:
     }
 
     std::vector<uint8_t> tags_;
-    std::unique_ptr<Copy*[]> winners_;
+    std::unique_ptr<uintptr_t[]> winners_;
 };
 
 template<class Copy>
@@ -255,18 +268,8 @@ EventTotals process_event_records(const fs::path& data, int64_t start, int64_t e
             throw std::runtime_error("Invalid ingest_ts on a parsed event");
         }
         auto& partition = copies[worker][bucket_for_key(id)];
-        Event event;
-        const bool purchase = row[4] == "purchase";
-        if (!row[1].empty() && !row[5].empty() &&
-            (purchase || row[4] == "view" || row[4] == "cart")) {
-            const int64_t time = input::timestamp_ms(row[2]);
-            const uint32_t price = purchase ? input::purchase_price(row[6]) : 0;
-            if (time >= start && time < end && time >= ingest - day_ms &&
-                (!purchase || price != 0)) {
-                event = Event::encode(identities.person(row[1], people[worker]), time - time_base, price,
-                                      purchase ? products.category(row[5]) : 0);
-            }
-        }
+        const auto event = event_payload<Time>(row, ingest, start, end, time_base, products,
+            [&](std::string_view user) { return identities.person(user, people[worker]); });
         // Even an invalid copy can win deduplication and suppress later copies.
         partition.push_back({id, ingest, event});
     }, [&](const auto& files) {
@@ -283,10 +286,21 @@ EventTotals process_event_records(const fs::path& data, int64_t start, int64_t e
         if (count == 0) {
             return;
         }
-        EventWinners<Copy> winners(count);
+        EventWinnerSlots winners(count);
         for (auto& source : copies) {
             for (auto& copy : source[bucket]) {
-                winners.choose(copy);
+                auto& link = winners.find(hash_id(copy.id), [&](uintptr_t candidate) {
+                    return reinterpret_cast<Copy*>(candidate)->id == copy.id;
+                });
+                auto* winner = reinterpret_cast<Copy*>(link);
+                if (winner == nullptr || copy.ingest < winner->ingest) {
+                    if (winner != nullptr) {
+                        winner->event.person = 0;
+                    }
+                    link = reinterpret_cast<uintptr_t>(&copy);
+                } else {
+                    copy.event.person = 0;
+                }
             }
         }
         // The table compares IDs and ingest times only. Marked losers can be
@@ -350,13 +364,17 @@ EventTotals process_event_records(const fs::path& data, int64_t start, int64_t e
     return totals;
 }
 
-inline EventTotals process_events(const fs::path& data, int64_t start, int64_t end,
-                                  const Identities& identities, const Products& products,
-                                  unsigned threads, StageTimer& timer) {
+inline bool compact_events_fit(int64_t start, int64_t end, const Products& products) {
     // Only select the compact layout when every timestamp and category can
     // be represented exactly. The price limit fits in 24 bits in both cases.
     const auto span = static_cast<uint64_t>(end) - static_cast<uint64_t>(start);
-    if (span <= (uint64_t{1} << 32) && products.categories.size() <= 256) {
+    return span <= (uint64_t{1} << 32) && products.categories.size() <= 256;
+}
+
+inline EventTotals process_events(const fs::path& data, int64_t start, int64_t end,
+                                  const Identities& identities, const Products& products,
+                                  unsigned threads, StageTimer& timer) {
+    if (compact_events_fit(start, end, products)) {
         return process_event_records<uint32_t>(data, start, end, identities, products, threads, timer);
     }
     return process_event_records<int64_t>(data, start, end, identities, products, threads, timer);

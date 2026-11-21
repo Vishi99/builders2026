@@ -16,6 +16,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 namespace shopping {
 
 namespace fs = std::filesystem;
@@ -223,11 +227,58 @@ class IdMap {
 
 public:
     uint64_t get(uint64_t key, uint64_t hash) const {
+#if defined(__SSE2__)
+        if (!fingerprints_.empty()) {
+            return get_by_fingerprint(key, hash);
+        }
+#endif
+        if (!bloom_.empty()) {
+            const auto bits = bloom_bits(hash);
+            if ((bloom_[hash & (bloom_.size() - 1)] & bits) != bits) {
+                return 0;
+            }
+        }
         return entries_[slot(key, hash)].value;
     }
 
     void reserve(size_t count) {
         entries_.resize(std::max<size_t>(16, std::bit_ceil(count + count / 2 + 1)));
+    }
+
+    // Alias shards have a known number of distinct keys and become read-only
+    // once built. The union-find index still uses the ordinary mutable path.
+    void reserve_aliases(size_t count) {
+        reserve(count);
+        if (count == 0) {
+            return;
+        }
+#if defined(__SSE2__)
+        // In the local benchmarks the Bloom precheck worked best on 128 KiB
+        // shards, while control-byte probes won on the larger shards.
+        constexpr size_t bloom_shard_bytes = 128 * 1024;
+        if (entries_.size() > bloom_shard_bytes / sizeof(Entry)) {
+            fingerprints_.resize(entries_.size() + probe_width - 1);
+            return;
+        }
+#endif
+        bloom_.resize(std::bit_ceil((count + 7) / 8));
+    }
+
+    void insert_alias(uint64_t key, uint64_t person, uint64_t hash) {
+        const auto index = slot(key, hash);
+        entries_[index] = {key, person};
+#if defined(__SSE2__)
+        if (!fingerprints_.empty()) {
+            const auto tag = fingerprint(hash);
+            fingerprints_[index] = tag;
+            // Mirror the start of the ring so every 16-byte load is in bounds.
+            if (index < probe_width - 1) {
+                fingerprints_[entries_.size() + index] = tag;
+            }
+            return;
+        }
+#endif
+        bloom_[hash & (bloom_.size() - 1)] |= bloom_bits(hash);
     }
 
     template<class NewValue>
@@ -253,16 +304,59 @@ public:
         return value;
     }
 
-    template<class Resolve>
-    void resolve_values(Resolve&& resolve) {
-        for (auto& entry : entries_) {
+    template<class Visit>
+    void for_each(Visit&& visit) const {
+        for (const auto& entry : entries_) {
             if (entry.key != 0) {
-                entry.value = resolve(entry.value);
+                visit(entry.key, entry.value);
             }
         }
     }
 
 private:
+    static uint64_t bloom_bits(uint64_t hash) {
+        // All four probes share one word. Avoid bits 32–39, which are fixed
+        // within the alias shard.
+        return (uint64_t{1} << ((hash >> 40) & 63)) |
+               (uint64_t{1} << ((hash >> 46) & 63)) |
+               (uint64_t{1} << ((hash >> 52) & 63)) |
+               (uint64_t{1} << (hash >> 58));
+    }
+
+#if defined(__SSE2__)
+    static constexpr size_t probe_width = 16;
+
+    static uint8_t fingerprint(uint64_t hash) {
+        return static_cast<uint8_t>((hash >> 56) | 0x80);
+    }
+
+    uint64_t get_by_fingerprint(uint64_t key, uint64_t hash) const {
+        const size_t mask = entries_.size() - 1;
+        const auto expected = _mm_set1_epi8(static_cast<char>(fingerprint(hash)));
+        size_t index = hash & mask;
+        for (;;) {
+            const auto group = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(fingerprints_.data() + index));
+            const unsigned empty = _mm_movemask_epi8(_mm_cmpeq_epi8(group, _mm_setzero_si128()));
+            unsigned matches = _mm_movemask_epi8(_mm_cmpeq_epi8(group, expected));
+            if (empty != 0) {
+                matches &= (1u << std::countr_zero(empty)) - 1;
+            }
+            while (matches != 0) {
+                const auto& entry = entries_[(index + std::countr_zero(matches)) & mask];
+                if (entry.key == key) {
+                    return entry.value;
+                }
+                matches &= matches - 1;
+            }
+            if (empty != 0) {
+                return 0;
+            }
+            index = (index + probe_width) & mask;
+        }
+    }
+#endif
+
     size_t slot(uint64_t key, uint64_t hash) const {
         const size_t mask = entries_.size() - 1;
         size_t index = hash & mask;
@@ -274,6 +368,10 @@ private:
 
     std::vector<Entry> entries_ = std::vector<Entry>(16);
     size_t size_ = 0;
+    std::vector<uint64_t> bloom_;
+#if defined(__SSE2__)
+    std::vector<uint8_t> fingerprints_;
+#endif
 };
 
 class Identities {
@@ -305,11 +403,12 @@ public:
         for (const auto& shard : edges) {
             count += shard.size();
         }
-        aliases_.reserve(count);
+        IdMap linked_nodes;
+        linked_nodes.reserve(count);
         std::vector<Node> nodes;
         nodes.reserve(count);
         auto node_for = [&](uint64_t key) {
-            return static_cast<uint32_t>(aliases_.get_or_insert(key, [&] {
+            return static_cast<uint32_t>(linked_nodes.get_or_insert(key, [&] {
                 const auto at = static_cast<uint32_t>(nodes.size());
                 nodes.push_back({key, at, 1});
                 return uint64_t{at} + 1;
@@ -343,12 +442,36 @@ public:
         for (size_t index = 0; index < nodes.size(); ++index) {
             nodes[index].minimum = nodes[root(index)].minimum;
         }
-        aliases_.resolve_values([&](uint64_t index) { return nodes[index - 1].minimum; });
+        // The read-side map only needs IDs that actually change. Shard it
+        // using the same hash bits as the raw event partitions.
+        std::array<size_t, partition_count> sizes{};
+        linked_nodes.for_each([&](uint64_t key, uint64_t index) {
+            if (key != nodes[index - 1].minimum) {
+                ++sizes[bucket_for_key(key)];
+            }
+        });
+        for (size_t bucket = 0; bucket < partition_count; ++bucket) {
+            aliases_[bucket].reserve_aliases(sizes[bucket]);
+        }
+        linked_nodes.for_each([&](uint64_t key, uint64_t index) {
+            const auto person = nodes[index - 1].minimum;
+            if (key != person) {
+                const uint64_t hash = hash_id(key);
+                aliases_[(hash >> 32) % partition_count].insert_alias(key, person, hash);
+            }
+        });
+    }
+
+    uint64_t key(std::string_view user) const {
+        return keys_.key(user);
+    }
+
+    uint64_t canonical(uint64_t key) const {
+        return canonical_key(key, hash_id(key));
     }
 
     uint64_t person(std::string_view user) const {
-        const uint64_t key = keys_.key(user);
-        return canonical_key(key, hash_id(key));
+        return canonical(key(user));
     }
 
     uint64_t person(std::string_view user, LookupCache& cache) const {
@@ -363,12 +486,12 @@ public:
 
 private:
     uint64_t canonical_key(uint64_t key, uint64_t hash) const {
-        const uint64_t canonical = aliases_.get(key, hash);
+        const uint64_t canonical = aliases_[(hash >> 32) % partition_count].get(key, hash);
         return canonical == 0 ? key : canonical;
     }
 
     const IdKeys& keys_;
-    IdMap aliases_;
+    std::array<IdMap, partition_count> aliases_;
 };
 
 }  // namespace shopping

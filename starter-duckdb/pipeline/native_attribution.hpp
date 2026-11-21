@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -23,10 +24,11 @@ struct CampaignDay {
 
 namespace attribution {
 
-struct Click {
+template<class Time>
+struct ClickRecord {
     uint64_t person;
-    int64_t timestamp;
     uint64_t id;
+    Time timestamp;
     uint32_t campaign;
 };
 
@@ -36,12 +38,43 @@ struct AssistInterval {
     bool active = false;
 };
 
-using Totals = std::unordered_map<uint64_t, CampaignDay>;
+class Totals {
+public:
+    Totals(int32_t first, size_t days, size_t campaigns)
+        : first_(first), days_(days), dense_(days * campaigns) {}
 
-inline CampaignDay& campaign_day(Totals& totals, uint32_t campaign, int32_t day) {
-    const auto key = (uint64_t{campaign} << 32) | static_cast<uint32_t>(day);
-    return totals.try_emplace(key, CampaignDay{campaign, day}).first->second;
-}
+    CampaignDay& at(uint32_t campaign, int32_t day) {
+        if (!dense_.empty()) {
+            return dense_[campaign * days_ + static_cast<size_t>(day - first_)];
+        }
+        const auto key = (uint64_t{campaign} << 32) | static_cast<uint32_t>(day);
+        return sparse_.try_emplace(key, CampaignDay{campaign, day}).first->second;
+    }
+
+    template<class Visit>
+    void for_each(Visit visit) const {
+        if (dense_.empty()) {
+            for (const auto& [key, value] : sparse_) {
+                visit(value);
+            }
+            return;
+        }
+        for (size_t index = 0; index < dense_.size(); ++index) {
+            auto value = dense_[index];
+            if (value.sessions || value.assisted_sessions) {
+                value.campaign = static_cast<uint32_t>(index / days_);
+                value.day = first_ + static_cast<int32_t>(index % days_);
+                visit(value);
+            }
+        }
+    }
+
+private:
+    int32_t first_;
+    size_t days_;
+    std::vector<CampaignDay> dense_;
+    std::unordered_map<uint64_t, CampaignDay> sparse_;
+};
 
 inline const Session* session_at_or_after(const Session* begin, const Session* end,
                                           int64_t timestamp) {
@@ -61,39 +94,42 @@ inline void count_assists(Totals& totals, uint32_t campaign, const AssistInterva
         // Session times are integer milliseconds, so last + 1 excludes the
         // first session outside the inclusive seven-day interval.
         const auto* next = session_at_or_after(session + 1, end, std::min(next_day, last + 1));
-        campaign_day(totals, campaign, day).assisted_sessions += next - session;
+        totals.at(campaign, day).assisted_sessions += next - session;
         session = next;
     }
 }
 
-template<class ClickKeys>
+template<class Click, class ClickKeys>
 void credit_sessions(Totals& totals, const Session* sessions, const Session* session_end,
-                     const Click* clicks, const Click* click_end, const ClickKeys& click_keys) {
+                     const Click* clicks, const Click* click_end, const ClickKeys& click_keys,
+                     int64_t time_base) {
     const Click* winner = nullptr;
     for (auto* session = sessions; session != session_end; ++session) {
-        while (clicks != click_end && clicks->timestamp <= session->start_ms) {
+        while (clicks != click_end && clicks->timestamp <= session->start_ms - time_base) {
             if (!winner || clicks->timestamp != winner->timestamp ||
                 click_keys.less(clicks->id, winner->id)) {
                 winner = clicks;
             }
             ++clicks;
         }
-        const auto campaign = winner && session->start_ms - winner->timestamp <= week_ms
+        const auto campaign = winner && session->start_ms - time_base - winner->timestamp <= week_ms
             ? winner->campaign : 0;
-        auto& daily = campaign_day(totals, campaign, day_number(session->start_ms));
+        auto& daily = totals.at(campaign, day_number(session->start_ms));
         ++daily.sessions;
         daily.purchasing_sessions += session->revenue != 0;
         daily.revenue_cents += session->revenue;
     }
 }
 
-inline void assist_sessions(Totals& totals, const Session* sessions, const Session* session_end,
+template<class Click>
+void assist_sessions(Totals& totals, const Session* sessions, const Session* session_end,
                             const Click* clicks, const Click* click_end,
-                            std::vector<AssistInterval>& intervals, std::vector<uint32_t>& touched) {
+                            std::vector<AssistInterval>& intervals, std::vector<uint32_t>& touched,
+                            int64_t time_base) {
     // Restrict the sorted clicks to those that can reach any of this
     // person's sessions before building the per-campaign interval union.
-    const auto earliest = sessions->start_ms - week_ms;
-    const auto latest = session_end[-1].start_ms;
+    const auto earliest = sessions->start_ms - week_ms - time_base;
+    const auto latest = session_end[-1].start_ms - time_base;
     while (clicks != click_end && clicks->timestamp < earliest) {
         ++clicks;
     }
@@ -102,12 +138,12 @@ inline void assist_sessions(Totals& totals, const Session* sessions, const Sessi
         if (!interval.active) {
             touched.push_back(clicks->campaign);
             interval.active = true;
-            interval.first = clicks->timestamp;
-        } else if (clicks->timestamp - interval.last > week_ms) {
+            interval.first = time_base + clicks->timestamp;
+        } else if (time_base + clicks->timestamp - interval.last > week_ms) {
             count_assists(totals, clicks->campaign, interval, sessions, session_end);
-            interval.first = clicks->timestamp;
+            interval.first = time_base + clicks->timestamp;
         }
-        interval.last = clicks->timestamp;
+        interval.last = time_base + clicks->timestamp;
     }
     for (const auto campaign : touched) {
         auto& interval = intervals[campaign];
@@ -119,15 +155,14 @@ inline void assist_sessions(Totals& totals, const Session* sessions, const Sessi
 
 } // namespace attribution
 
-template<class Ids, class ClickKeys, class CampaignIds>
-std::vector<CampaignDay> attribute(
+template<class Time, class ClickKeys, class CampaignIds, class ResolveUser>
+Partitioned<attribution::ClickRecord<Time>> scan_click_records(
     const std::filesystem::path& data, int64_t start_ms, int64_t end_ms,
-    const std::vector<std::vector<Session>>& sessions, const Ids& identities, ClickKeys& click_keys,
-    const CampaignIds& campaign_ids, unsigned threads
+    ClickKeys& click_keys, const CampaignIds& campaign_ids, unsigned threads, int64_t time_base,
+    ResolveUser&& resolve_user, const std::vector<std::vector<Session>>* sessions = nullptr
 ) {
-    using namespace attribution;
-    const auto bucket_count = sessions.size();
-    std::vector worker_clicks(threads, std::vector<std::vector<Click>>(bucket_count));
+    using Click = attribution::ClickRecord<Time>;
+    Partitioned<Click> worker_clicks(threads);
 
     scan_shards<4>(data / "clicks", threads, [&](const auto& fields, unsigned worker) {
         if (fields[0].empty() || fields[1].empty()) {
@@ -142,18 +177,42 @@ std::vector<CampaignDay> attribute(
             timestamp < start_ms - week_ms || timestamp >= end_ms) {
             return;
         }
-        const auto person = identities.person(fields[1]);
+        const auto person = resolve_user(fields[1], worker);
         const auto bucket = bucket_for_key(person);
-        if (!sessions[bucket].empty()) {
+        if (sessions == nullptr || !(*sessions)[bucket].empty()) {
             // Identical click copies are harmless to both the minimum-ID
             // tiebreak and the union of each campaign's assist intervals.
             worker_clicks[worker][bucket].push_back(
-                Click{person, timestamp, click_keys.key(fields[0]), campaign->second});
+                Click{person, click_keys.key(fields[0]), static_cast<Time>(timestamp - time_base), campaign->second});
         }
+    }, [&](const auto& files) {
+        reserve_copies(files, worker_clicks);
     });
+    return worker_clicks;
+}
 
-    std::vector<Totals> worker_totals(threads);
-    std::vector worker_intervals(threads, std::vector<AssistInterval>(campaign_ids.size() + 1));
+// Clicks are already bucketed by canonical person. campaign_count excludes organic.
+template<class Time, class ClickKeys>
+std::vector<CampaignDay> attribute_partitioned(
+    int64_t start_ms, int64_t end_ms, const std::vector<std::vector<Session>>& sessions,
+    Partitioned<attribution::ClickRecord<Time>> worker_clicks, const ClickKeys& click_keys,
+    size_t campaign_count, unsigned threads, int64_t time_base
+) {
+    using namespace attribution;
+    using Click = ClickRecord<Time>;
+    const auto bucket_count = sessions.size();
+    const auto first_day = day_number(start_ms);
+    const size_t days = static_cast<int64_t>(day_number(end_ms - 1)) - first_day + 1;
+    const auto campaigns = campaign_count + 1;
+    // Preserve sparse storage for large date/dimension ranges.
+    constexpr size_t dense_budget = 16 * 1024 * 1024 / sizeof(CampaignDay);
+    const auto dense_days = days <= dense_budget / threads / campaigns ? days : 0;
+    std::vector<Totals> worker_totals;
+    worker_totals.reserve(threads);
+    for (unsigned worker = 0; worker < threads; ++worker) {
+        worker_totals.emplace_back(first_day, dense_days, campaigns);
+    }
+    std::vector worker_intervals(threads, std::vector<AssistInterval>(campaigns));
     std::vector<std::vector<uint32_t>> worker_touched(threads);
     parallel_for(bucket_count, threads, [&](size_t bucket, unsigned worker) {
         const auto& bucket_sessions = sessions[bucket];
@@ -168,7 +227,8 @@ std::vector<CampaignDay> attribute(
                 largest = index;
             }
         }
-        auto bucket_clicks = std::move(worker_clicks[largest][bucket]);
+        auto bucket_clicks = worker_clicks.empty() ? std::vector<Click>{}
+                                                 : std::move(worker_clicks[largest][bucket]);
         bucket_clicks.reserve(click_count);
         for (size_t index = 0; index < worker_clicks.size(); ++index) {
             if (index == largest) {
@@ -199,34 +259,70 @@ std::vector<CampaignDay> attribute(
                 ++click_end;
             }
             credit_sessions(totals, std::to_address(session), std::to_address(session_end),
-                            std::to_address(next_click), std::to_address(click_end), click_keys);
+                            std::to_address(next_click), std::to_address(click_end), click_keys, time_base);
             if (next_click != click_end) {
                 assist_sessions(totals, std::to_address(session), std::to_address(session_end),
                                 std::to_address(next_click), std::to_address(click_end),
-                                worker_intervals[worker], worker_touched[worker]);
+                                worker_intervals[worker], worker_touched[worker], time_base);
             }
             session = session_end;
             next_click = click_end;
         }
     });
 
-    Totals merged;
+    Totals merged(first_day, dense_days, campaigns);
     for (const auto& totals : worker_totals) {
-        for (const auto& entry : totals) {
-            const auto& daily = entry.second;
-            auto& combined = campaign_day(merged, daily.campaign, daily.day);
+        totals.for_each([&](const CampaignDay& daily) {
+            auto& combined = merged.at(daily.campaign, daily.day);
             combined.sessions += daily.sessions;
             combined.purchasing_sessions += daily.purchasing_sessions;
             combined.revenue_cents += daily.revenue_cents;
             combined.assisted_sessions += daily.assisted_sessions;
-        }
+        });
     }
     std::vector<CampaignDay> result;
-    result.reserve(merged.size());
-    for (const auto& entry : merged) {
-        result.push_back(entry.second);
-    }
+    merged.for_each([&](const CampaignDay& daily) {
+        result.push_back(daily);
+    });
     return result;
+}
+
+template<class Time, class Ids, class ClickKeys, class CampaignIds>
+std::vector<CampaignDay> attribute_records(
+    const std::filesystem::path& data, int64_t start_ms, int64_t end_ms,
+    const std::vector<std::vector<Session>>& sessions, const Ids& identities, ClickKeys& click_keys,
+    const CampaignIds& campaign_ids, unsigned threads, int64_t time_base
+) {
+    std::vector<typename Ids::LookupCache> people(threads);
+    auto clicks = scan_click_records<Time>(
+        data, start_ms, end_ms, click_keys, campaign_ids, threads, time_base,
+        [&](std::string_view user, unsigned worker) {
+            return identities.person(user, people[worker]);
+        }, &sessions);
+    return attribute_partitioned(start_ms, end_ms, sessions, std::move(clicks), click_keys,
+                                 campaign_ids.size(), threads, time_base);
+}
+
+template<class Ids, class ClickKeys, class CampaignIds>
+std::vector<CampaignDay> attribute(
+    const std::filesystem::path& data, int64_t start_ms, int64_t end_ms,
+    const std::vector<std::vector<Session>>& sessions, const Ids& identities, ClickKeys& click_keys,
+    const CampaignIds& campaign_ids, unsigned threads
+) {
+    if (std::all_of(sessions.begin(), sessions.end(), [](const auto& bucket) {
+            return bucket.empty();
+        })) {
+        return {};
+    }
+
+    const auto time_base = start_ms - week_ms;
+    const auto span = static_cast<uint64_t>(end_ms) - static_cast<uint64_t>(time_base);
+    if (span <= (uint64_t{1} << 32)) {
+        return attribute_records<uint32_t>(data, start_ms, end_ms, sessions, identities,
+                                           click_keys, campaign_ids, threads, time_base);
+    }
+    return attribute_records<int64_t>(data, start_ms, end_ms, sessions, identities,
+                                      click_keys, campaign_ids, threads, 0);
 }
 
 } // namespace shopping
