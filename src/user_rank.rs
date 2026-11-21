@@ -11,6 +11,26 @@ const INVERSE_A: u64 = 0x3dee_2192_63;
 const ALIAS_BITS: u32 = 9;
 const CODE_ALIASES: u64 = 8;
 
+const fn digit(value: usize) -> u8 {
+    if value < 10 {
+        b'0' + value as u8
+    } else {
+        b'a' + (value - 10) as u8
+    }
+}
+
+const fn digit_pairs() -> [[u8; 2]; 1296] {
+    let mut pairs = [[0; 2]; 1296];
+    let mut n = 0;
+    while n < pairs.len() {
+        pairs[n] = [digit(n / 36), digit(n % 36)];
+        n += 1;
+    }
+    pairs
+}
+
+static PAIRS: [[u8; 2]; 1296] = digit_pairs();
+
 #[derive(Clone, Copy, Debug)]
 pub struct UserLayout {
     key: u64,
@@ -18,6 +38,11 @@ pub struct UserLayout {
 }
 
 impl UserLayout {
+    #[inline]
+    pub(crate) fn batch_parts(self) -> (u64, u64) {
+        (self.key, self.groups as u64)
+    }
+
     #[inline]
     fn ordinal(&self, projected: u64) -> u64 {
         ordinal(projected, self.key)
@@ -58,21 +83,17 @@ impl UserLayout {
     }
 
     fn spelling<'b>(&self, code: u32, bytes: &'b mut [u8; 9]) -> &'b [u8] {
-        let mut number = self.number(code);
+        let mut number = self.number(code) as usize;
         let mut index = bytes.len();
         loop {
-            let digit = (number % 36) as u8;
-            number /= 36;
-            index -= 1;
-            bytes[index] = if digit < 10 {
-                b'0' + digit
-            } else {
-                b'a' + digit - 10
-            };
+            index -= 2;
+            bytes[index..index + 2].copy_from_slice(&PAIRS[number % 1296]);
+            number /= 1296;
             if number == 0 {
                 break;
             }
         }
+        index += usize::from(bytes[index] == b'0');
         index -= 1;
         bytes[index] = b'u';
         &bytes[index..]

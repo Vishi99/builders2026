@@ -33,67 +33,66 @@ impl LinkDirectory {
             .collect::<Vec<_>>();
         let jobs = csv::chunks(files, 128 << 10);
         let next_job = AtomicUsize::new(0);
-        let mut escaped = thread::scope(|scope| {
-            let handles = (0..workers)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut escaped = Vec::new();
-                        loop {
-                            let job = next_job.fetch_add(1, Ordering::Relaxed);
-                            let Some(input) = jobs.get(job) else {
-                                break;
-                            };
-                            csv::rows::<2>(input, |[a, b]| {
-                                if a == b || a.is_empty() || b.is_empty() {
-                                    return;
-                                }
-                                let left = layout.encode(a);
-                                let right = layout.encode(b);
-                                if let (Some(left), Some(right)) = (left, right) {
-                                    let (group, a) = split(left);
-                                    let (group_b, b) = split(right);
-                                    if group == group_b {
-                                        let bits = (1u64 << (a * 8 + b)) | (1u64 << (b * 8 + a));
-                                        edges[group].fetch_or(bits, Ordering::Relaxed);
-                                        return;
-                                    }
-                                }
-                                let endpoint = |raw, compact: Option<u32>| {
-                                    compact.map_or_else(
-                                        || Endpoint::Wide(names.key(raw)),
-                                        Endpoint::Code,
-                                    )
-                                };
-                                escaped.push((endpoint(a, left), endpoint(b, right)));
-                            });
+        let parse = || {
+            let mut escaped = Vec::new();
+            loop {
+                let job = next_job.fetch_add(1, Ordering::Relaxed);
+                let Some(input) = jobs.get(job) else { break };
+                csv::rows::<2>(input, |[a, b]| {
+                    if a == b || a.is_empty() || b.is_empty() {
+                        return;
+                    }
+                    let left = layout.encode(a);
+                    let right = layout.encode(b);
+                    if let (Some(left), Some(right)) = (left, right) {
+                        let (group, a) = split(left);
+                        let (group_b, b) = split(right);
+                        if group == group_b {
+                            let bits = (1u64 << (a * 8 + b)) | (1u64 << (b * 8 + a));
+                            edges[group].fetch_or(bits, Ordering::Relaxed);
+                            return;
                         }
-                        escaped
-                    })
-                })
+                    }
+                    let endpoint = |raw, compact: Option<u32>| {
+                        compact.map_or_else(|| Endpoint::Wide(names.key(raw)), Endpoint::Code)
+                    };
+                    escaped.push((endpoint(a, left), endpoint(b, right)));
+                });
+            }
+            escaped
+        };
+        let mut escaped = thread::scope(|scope| {
+            let helpers = (1..workers)
+                .map(|_| scope.spawn(&parse))
                 .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .flat_map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
+            let mut escaped = parse();
+            for helper in helpers {
+                escaped.extend(helper.join().unwrap());
+            }
+            escaped
         });
 
         let mut local = vec![0u32; layout.groups];
         let group_block = layout.groups.div_ceil(workers).max(1);
+        let reduce = |first, output: &mut [u32], input: &[AtomicU64]| {
+            for (offset, (roots, mask)) in output.iter_mut().zip(input).enumerate() {
+                let mask = mask.load(Ordering::Relaxed);
+                if mask != 0 {
+                    *roots = packed_components(first + offset, mask, layout);
+                }
+            }
+        };
         thread::scope(|scope| {
-            for (block, (output, input)) in local
+            let mut blocks = local
                 .chunks_mut(group_block)
                 .zip(edges.chunks(group_block))
-                .enumerate()
-            {
-                scope.spawn(move || {
-                    let first = block * group_block;
-                    for (offset, (roots, mask)) in output.iter_mut().zip(input).enumerate() {
-                        let mask = mask.load(Ordering::Relaxed);
-                        if mask != 0 {
-                            *roots = packed_components(first + offset, mask, layout);
-                        }
-                    }
-                });
+                .enumerate();
+            let first = blocks.next();
+            for (block, (output, input)) in blocks {
+                scope.spawn(move || reduce(block * group_block, output, input));
+            }
+            if let Some((block, (output, input))) = first {
+                reduce(block * group_block, output, input);
             }
         });
         drop(edges);

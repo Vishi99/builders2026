@@ -34,7 +34,9 @@ const UINT32: i32 = 13;
 const UINT64: i32 = 14;
 const PLAIN: i32 = 0;
 const RLE: i32 = 3;
+const DICTIONARY_PAGE: i32 = 2;
 const DATA_PAGE_V2: i32 = 3;
+const RLE_DICTIONARY: i32 = 8;
 const UNCOMPRESSED: i32 = 0;
 
 #[derive(Clone, Copy)]
@@ -164,6 +166,7 @@ impl Compact<'_> {
 #[derive(Clone, Copy)]
 struct Column {
     offset: i64,
+    dictionary: Option<i64>,
     bytes: i64,
 }
 
@@ -176,6 +179,23 @@ fn checked_len(len: usize) -> io::Result<i32> {
     i32::try_from(len).map_err(|_| io::Error::other("Parquet page exceeds its 32-bit size limit"))
 }
 
+fn bit_width(entries: usize) -> usize {
+    usize::BITS as usize - (entries.saturating_sub(1).max(1)).leading_zeros() as usize
+}
+
+fn bitpack(out: &mut Vec<u8>, mut ids: impl Iterator<Item = u32>, count: usize, width: usize) {
+    let groups = count.div_ceil(8);
+    out.push(width as u8);
+    varint(out, (groups as u64) * 2 + 1);
+    for _ in 0..groups {
+        let mut packed = 0u64;
+        for offset in 0..8 {
+            packed |= u64::from(ids.next().unwrap_or(0)) << (offset * width);
+        }
+        out.extend_from_slice(&packed.to_le_bytes()[..width]);
+    }
+}
+
 struct Part {
     file: BufWriter<File>,
     path: PathBuf,
@@ -186,6 +206,7 @@ struct Part {
     header: Vec<u8>,
     definition: Vec<u8>,
     values: Vec<u8>,
+    runs: Vec<u32>,
 }
 
 impl Part {
@@ -206,10 +227,43 @@ impl Part {
             header: Vec::new(),
             definition: Vec::new(),
             values: Vec::new(),
+            runs: Vec::new(),
         })
     }
 
     fn page(&mut self, rows: usize, nulls: usize) -> io::Result<Column> {
+        self.data_page(rows, nulls, None)
+    }
+
+    fn write_dictionary(&mut self, entries: usize) -> io::Result<i64> {
+        let length = checked_len(self.values.len())?;
+        self.header.clear();
+        let mut header = Compact {
+            bytes: &mut self.header,
+            prior: 0,
+        };
+        header.int(1, DICTIONARY_PAGE);
+        header.int(2, length);
+        header.int(3, length);
+        header.object(7, |dict| {
+            dict.int(1, entries as i32);
+            dict.int(2, PLAIN);
+        });
+        self.header.push(0);
+        let offset = self.offset;
+        self.file.write_all(&self.header)?;
+        self.file.write_all(&self.values)?;
+        self.offset += i64::from(length) + self.header.len() as i64;
+        self.values.clear();
+        Ok(offset)
+    }
+
+    fn data_page(
+        &mut self,
+        rows: usize,
+        nulls: usize,
+        dictionary: Option<i64>,
+    ) -> io::Result<Column> {
         let length = checked_len(self.values.len() + self.definition.len())?;
         self.header.clear();
         let mut header = Compact {
@@ -223,7 +277,14 @@ impl Part {
             page.int(1, rows as i32); // Number of values, including nulls.
             page.int(2, nulls as i32);
             page.int(3, rows as i32);
-            page.int(4, PLAIN);
+            page.int(
+                4,
+                if dictionary.is_some() {
+                    RLE_DICTIONARY
+                } else {
+                    PLAIN
+                },
+            );
             page.int(5, self.definition.len() as i32);
             page.int(6, 0); // Flat schema has no repetition levels.
             page.field(7, Wire::False);
@@ -235,7 +296,8 @@ impl Part {
         let bytes = i64::from(length) + self.header.len() as i64;
         let column = Column {
             offset: self.offset,
-            bytes,
+            dictionary,
+            bytes: bytes + self.offset - dictionary.unwrap_or(self.offset),
         };
         self.offset += bytes;
         self.values.clear();
@@ -289,34 +351,103 @@ impl Part {
         self.page(count, nulls)
     }
 
-    fn user_names(
+    fn compact_names(
         &mut self,
         rows: &[UserDay],
-        append_user: &impl Fn(u64, &mut Vec<u8>),
+        append: &impl Fn(u64, &mut Vec<u8>),
     ) -> io::Result<(usize, Column)> {
-        let mut previous = None;
-        for (index, row) in rows.iter().enumerate() {
-            match previous {
-                Some((person, start, end)) if row.person == person => {
-                    self.values.extend_from_within(start..end);
-                }
-                _ => {
-                    let start = self.values.len();
-                    let text = start + 4;
-                    self.values.resize(text, 0);
-                    append_user(row.person, &mut self.values);
-                    let end = self.values.len();
-                    let length = checked_len(end - text)?;
-                    self.values[start..text].copy_from_slice(&length.to_le_bytes());
-                    previous = Some((row.person, start, end));
-                }
-            }
-            // Keep unusually long identifiers from creating oversized pages.
+        self.runs.clear();
+        let mut count = 0;
+        while count < rows.len() {
+            let person = rows[count].person;
+            let limit = count
+                + rows[count..]
+                    .iter()
+                    .take_while(|row| row.person == person)
+                    .count();
+            let start = self.values.len();
+            self.values.extend_from_slice(&[0; 4]);
+            append(person, &mut self.values);
+            let len = checked_len(self.values.len() - start - 4)?;
+            self.values[start..start + 4].copy_from_slice(&len.to_le_bytes());
+            self.runs.push((limit - count) as u32);
+            count = limit;
             if self.values.len() >= 16 * 1024 * 1024 {
-                return Ok((index + 1, self.page(index + 1, 0)?));
+                break;
             }
         }
-        Ok((rows.len(), self.page(rows.len(), 0)?))
+        let entries = self.runs.len();
+        let dictionary = self.write_dictionary(entries)?;
+        let width = bit_width(entries);
+        let bytes = width.div_ceil(8);
+        self.values.push(width as u8);
+        // Aggregation emits a person's consecutive days together. Encode
+        // the original spelling once and repeat its index for that run.
+        for (id, &count) in self.runs.iter().enumerate() {
+            varint(&mut self.values, 2 * u64::from(count));
+            self.values
+                .extend_from_slice(&(id as u32).to_le_bytes()[..bytes]);
+        }
+        self.data_page(count, 0, Some(dictionary))
+            .map(|column| (count, column))
+    }
+
+    fn dates(&mut self, rows: &[UserDay]) -> io::Result<Column> {
+        let (min, max) = rows.iter().fold((i32::MAX, i32::MIN), |(min, max), row| {
+            (min.min(row.day), max.max(row.day))
+        });
+        let entries = i64::from(max) - i64::from(min) + 1;
+        if entries > 64 {
+            return self.integers(rows.len(), rows.iter().map(|r| r.day.to_le_bytes()));
+        }
+        for day in min..=max {
+            self.values.extend_from_slice(&day.to_le_bytes());
+        }
+        let dictionary = self.write_dictionary(entries as usize)?;
+        bitpack(
+            &mut self.values,
+            rows.iter().map(|r| (r.day - min) as u32),
+            rows.len(),
+            bit_width(entries as usize),
+        );
+        self.data_page(rows.len(), 0, Some(dictionary))
+    }
+
+    fn categories(&mut self, rows: &[UserDay], categories: &[Vec<u8>]) -> io::Result<Column> {
+        let entries = categories.len().saturating_sub(1);
+        let non_null = rows.iter().filter(|r| r.category != 0).count();
+        if !(1..=256).contains(&entries) || non_null == 0 {
+            return self.text(
+                rows.len(),
+                rows.iter()
+                    .map(|r| (r.category != 0).then(|| categories[r.category as usize].as_slice())),
+                true,
+            );
+        }
+        for category in &categories[1..] {
+            let length = checked_len(category.len())?;
+            self.values.extend_from_slice(&length.to_le_bytes());
+            self.values.extend_from_slice(category);
+        }
+        let dictionary = self.write_dictionary(entries)?;
+        let bytes = rows.len().div_ceil(8);
+        varint(&mut self.definition, ((bytes as u64) << 1) | 1);
+        let start = self.definition.len();
+        self.definition.resize(start + bytes, 0);
+        for (i, row) in rows.iter().enumerate() {
+            if row.category != 0 {
+                self.definition[start + i / 8] |= 1 << (i % 8);
+            }
+        }
+        bitpack(
+            &mut self.values,
+            rows.iter()
+                .filter(|r| r.category != 0)
+                .map(|r| r.category - 1),
+            non_null,
+            bit_width(entries),
+        );
+        self.data_page(rows.len(), rows.len() - non_null, Some(dictionary))
     }
 
     fn group(&mut self, rows: usize, columns: Vec<Column>) {
@@ -368,13 +499,21 @@ fn footer(schema: &[Field], groups: &[Group]) -> Vec<u8> {
             out.list(1, Wire::Struct, schema.len());
             for (&field, column) in schema.iter().zip(&group.columns) {
                 out.item(|chunk| {
-                    chunk.long(2, column.offset);
+                    chunk.long(2, column.dictionary.unwrap_or(column.offset));
                     chunk.object(3, |meta| {
                         meta.int(1, field.physical);
-                        meta.list(2, Wire::I32, 1 + usize::from(field.optional));
+                        meta.list(
+                            2,
+                            Wire::I32,
+                            1 + usize::from(field.optional)
+                                + usize::from(column.dictionary.is_some()),
+                        );
                         meta.integer(PLAIN.into());
                         if field.optional {
                             meta.integer(RLE.into());
+                        }
+                        if column.dictionary.is_some() {
+                            meta.integer(RLE_DICTIONARY.into());
                         }
                         meta.list(3, Wire::Bytes, 1);
                         meta.bytes(field.name);
@@ -383,6 +522,9 @@ fn footer(schema: &[Field], groups: &[Group]) -> Vec<u8> {
                         meta.long(6, column.bytes);
                         meta.long(7, column.bytes);
                         meta.long(9, column.offset);
+                        if let Some(dictionary_offset) = column.dictionary {
+                            meta.long(11, dictionary_offset);
+                        }
                     });
                 });
             }
@@ -409,22 +551,16 @@ impl UserWriter {
     ) -> io::Result<()> {
         let file = &mut self.0;
         while !rows.is_empty() {
-            let (count, names) =
-                file.user_names(&rows[..rows.len().min(GROUP_ROWS)], &append_user)?;
+            let page = &rows[..rows.len().min(GROUP_ROWS)];
+            let (count, names) = file.compact_names(page, &append_user)?;
             let group = &rows[..count];
             let columns = vec![
                 names,
-                file.integers(count, group.iter().map(|row| row.day.to_le_bytes()))?,
+                file.dates(group)?,
                 file.integers(count, group.iter().map(|row| row.sessions.to_le_bytes()))?,
                 file.integers(count, group.iter().map(|row| row.events.to_le_bytes()))?,
                 file.integers(count, group.iter().map(|row| row.revenue.to_le_bytes()))?,
-                file.text(
-                    count,
-                    group.iter().map(|row| {
-                        (row.category != 0).then(|| categories[row.category as usize].as_slice())
-                    }),
-                    true,
-                )?,
+                file.categories(group, categories)?,
             ];
             file.group(count, columns);
             rows = &rows[count..];

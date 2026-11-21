@@ -441,7 +441,7 @@ fn eight_digits(raw: u64) -> Option<u32> {
     Some((quads.wrapping_mul(0x0000_2710_0000_0001) >> 32) as u32)
 }
 
-fn milliseconds(bytes: &[u8]) -> Option<i64> {
+pub(crate) fn milliseconds(bytes: &[u8]) -> Option<i64> {
     if bytes.len() == 13 {
         let head = eight_digits(u64::from_le_bytes(bytes[..8].try_into().ok()?))?;
         let tail = eight_digits(u64::from_le_bytes(bytes[5..].try_into().ok()?))? % 100_000;
@@ -508,7 +508,7 @@ impl Clock {
     }
 
     #[inline]
-    fn midnight(&mut self, bytes: &[u8]) -> Option<i64> {
+    pub(crate) fn midnight(&mut self, bytes: &[u8]) -> Option<i64> {
         let year_month = u64::from_le_bytes(bytes[..8].try_into().ok()?);
         let day = u16::from_le_bytes([bytes[8], bytes[9]]);
         let slot = (usize::from(bytes[8]) * 10 + usize::from(bytes[9])) & 31;
@@ -600,7 +600,54 @@ enum EventFields<'a, 'row> {
     Wide(&'row [&'a [u8]; 7]),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ShortEvent<'a> {
+    bytes: &'a [u8],
+    cuts: u64,
+    quoted: u8,
+}
+
+impl<'a> ShortEvent<'a> {
+    #[inline(always)]
+    pub(crate) fn field<const INDEX: usize>(self) -> &'a [u8] {
+        let begin = if INDEX == 0 {
+            0
+        } else {
+            ((self.cuts >> ((INDEX - 1) * 8)) & 255) as usize + 1
+        };
+        let end = ((self.cuts >> (INDEX * 8)) & 255) as usize;
+        let skip = usize::from(self.quoted >> INDEX & 1);
+        // The structural scanner checked that the offsets are ordered and
+        // quotes occupy whole fields.
+        unsafe { self.bytes.get_unchecked(begin + skip..end - skip) }
+    }
+
+    pub(crate) fn row(self) -> EventRow<'a, 'a> {
+        EventRow(EventFields::Short {
+            bytes: self.bytes,
+            cuts: self.cuts,
+            quoted: self.quoted,
+        })
+    }
+}
+
 impl<'a> EventRow<'a, '_> {
+    #[inline(always)]
+    pub(crate) fn short(&self) -> Option<ShortEvent<'a>> {
+        match self.0 {
+            EventFields::Short {
+                bytes,
+                cuts,
+                quoted,
+            } => Some(ShortEvent {
+                bytes,
+                cuts,
+                quoted,
+            }),
+            EventFields::Wide(_) => None,
+        }
+    }
+
     #[inline(always)]
     pub fn field<const INDEX: usize>(&self) -> &'a [u8] {
         assert!(INDEX < 7);

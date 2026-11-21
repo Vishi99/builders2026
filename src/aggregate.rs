@@ -1,3 +1,5 @@
+pub(crate) mod packed;
+
 use crate::keys::FastMap;
 use crate::output::{CampaignDay, UserDay};
 use std::cmp::Ordering;
@@ -30,10 +32,10 @@ pub struct Activity<T> {
 }
 
 #[derive(Clone, Copy)]
-struct Interaction<T> {
-    id: u64,
-    time: T,
-    campaign: u32,
+pub(crate) struct Interaction<T> {
+    pub(crate) id: u64,
+    pub(crate) time: T,
+    pub(crate) campaign: u32,
 }
 
 impl<T: Copy> From<&Event<T>> for Activity<T> {
@@ -108,7 +110,7 @@ pub fn aggregate<T: Copy + Ord + Into<i64>>(
     overflow_purchases: &[(u32, u32)],
     compare_clicks: &impl Fn(u64, u64) -> Ordering,
     user_days: &mut Vec<UserDay>,
-    campaign_days: &mut FastMap<(u32, i32), CampaignDay>,
+    campaign_days: &mut CampaignGrid,
 ) {
     if events.iter().all(Vec::is_empty) {
         return;
@@ -166,48 +168,11 @@ pub fn aggregate_runs<T: Copy + Ord + Into<i64>>(
     overflow_purchases: &[(u32, u32)],
     compare_clicks: &impl Fn(u64, u64) -> Ordering,
     user_days: &mut Vec<UserDay>,
-    campaign_days: &mut FastMap<(u32, i32), CampaignDay>,
+    campaign_days: &mut CampaignGrid,
 ) {
-    let run_count = stripes.iter().map(|(runs, _)| runs.len()).sum::<usize>();
-    if run_count == 0 {
+    let (links, mut groups, person_index) = link_person_runs(stripes);
+    if groups.is_empty() {
         return;
-    }
-    assert!(run_count < NO_RUN as usize);
-    let mut links = Vec::<RunLink>::with_capacity(run_count);
-    let mut groups = Vec::<PersonRuns>::new();
-    let mut person_index = FastMap::default();
-    for (stripe, (runs, _)) in stripes.iter().enumerate() {
-        for (run, location) in runs.iter().enumerate() {
-            let current = links.len() as u32;
-            let count = location.end - location.start;
-            let position = match person_index.entry(location.person) {
-                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let position = groups.len() as u32;
-                    entry.insert(position);
-                    groups.push(PersonRuns {
-                        person: location.person,
-                        first: current,
-                        last: NO_RUN,
-                        event_count: 0,
-                        click_count: 0,
-                        click_end: 0,
-                    });
-                    position
-                }
-            };
-            let group = &mut groups[position as usize];
-            if group.last != NO_RUN {
-                links[group.last as usize].next = current;
-            }
-            group.last = current;
-            group.event_count += count;
-            links.push(RunLink {
-                stripe: stripe as u32,
-                run: run as u32,
-                next: NO_RUN,
-            });
-        }
     }
     let mut click_group = Vec::with_capacity(clicks.iter().map(Vec::len).sum());
     for click in clicks.iter().flatten() {
@@ -245,26 +210,154 @@ pub fn aggregate_runs<T: Copy + Ord + Into<i64>>(
     let mut combined = Vec::new();
     for group in groups {
         let clicks = &mut interactions[group.click_end - group.click_count..group.click_end];
-        let head = &links[group.first as usize];
-        let activities = if head.next == NO_RUN {
-            let (runs, activity) = &mut stripes[head.stripe as usize];
-            let run = &runs[head.run as usize];
-            &mut activity[run.start..run.end]
-        } else {
-            combined.clear();
-            combined.reserve(group.event_count);
-            let mut link = group.first;
-            while link != NO_RUN {
-                let node = &links[link as usize];
-                let (runs, activity) = &stripes[node.stripe as usize];
-                let run = &runs[node.run as usize];
-                combined.extend_from_slice(&activity[run.start..run.end]);
-                link = node.next;
-            }
-            &mut combined
-        };
+        let activities = collect_linked_events(
+            group.first,
+            group.event_count,
+            &links,
+            stripes,
+            &mut combined,
+        );
         let ordered = activities.is_sorted_by_key(|event| event.time);
         reducer.person_with_order(group.person, activities, clicks, ordered, false);
+    }
+}
+
+fn link_person_runs<T>(
+    stripes: &[(Vec<Run>, Vec<Activity<T>>)],
+) -> (Vec<RunLink>, Vec<PersonRuns>, FastMap<u64, u32>) {
+    let run_count = stripes.iter().map(|(runs, _)| runs.len()).sum::<usize>();
+    assert!(run_count < NO_RUN as usize);
+    let mut links = Vec::<RunLink>::with_capacity(run_count);
+    let mut groups = Vec::<PersonRuns>::new();
+    let mut person_index = FastMap::default();
+    for (stripe, (runs, _)) in stripes.iter().enumerate() {
+        for (run, location) in runs.iter().enumerate() {
+            let current = links.len() as u32;
+            let count = location.end - location.start;
+            let position = match person_index.entry(location.person) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let position = groups.len() as u32;
+                    entry.insert(position);
+                    groups.push(PersonRuns {
+                        person: location.person,
+                        first: current,
+                        last: NO_RUN,
+                        event_count: 0,
+                        click_count: 0,
+                        click_end: 0,
+                    });
+                    position
+                }
+            };
+            let group = &mut groups[position as usize];
+            if group.last != NO_RUN {
+                links[group.last as usize].next = current;
+            }
+            group.last = current;
+            group.event_count += count;
+            links.push(RunLink {
+                stripe: stripe as u32,
+                run: run as u32,
+                next: NO_RUN,
+            });
+        }
+    }
+    (links, groups, person_index)
+}
+
+fn collect_linked_events<'a, T: Copy>(
+    first: u32,
+    count: usize,
+    links: &[RunLink],
+    stripes: &'a mut [(Vec<Run>, Vec<Activity<T>>)],
+    combined: &'a mut Vec<Activity<T>>,
+) -> &'a mut [Activity<T>] {
+    let head = &links[first as usize];
+    if head.next == NO_RUN {
+        let (runs, activity) = &mut stripes[head.stripe as usize];
+        let run = &runs[head.run as usize];
+        &mut activity[run.start..run.end]
+    } else {
+        combined.clear();
+        combined.reserve(count);
+        let mut link = first;
+        while link != NO_RUN {
+            let node = &links[link as usize];
+            let (runs, activity) = &stripes[node.stripe as usize];
+            let run = &runs[node.run as usize];
+            combined.extend_from_slice(&activity[run.start..run.end]);
+            link = node.next;
+        }
+        combined
+    }
+}
+
+pub(crate) fn aggregate_runs_indexed<'a, T: Copy + Ord + Into<i64> + 'a>(
+    stripes: &mut [(Vec<Run>, Vec<Activity<T>>)],
+    clicks: &impl Fn(u64) -> &'a [Interaction<T>],
+    bases: (i64, i64),
+    categories: usize,
+    overflow_purchases: &[(u32, u32)],
+    compare_clicks: &impl Fn(u64, u64) -> Ordering,
+    user_days: &mut Vec<UserDay>,
+    campaign_days: &mut CampaignGrid,
+) {
+    let (links, groups, _) = link_person_runs(stripes);
+    if groups.is_empty() {
+        return;
+    }
+    let mut reducer = Reducer::new(
+        bases,
+        categories,
+        overflow_purchases,
+        compare_clicks,
+        user_days,
+        campaign_days,
+    );
+    let mut combined = Vec::new();
+    let mut scratch = Vec::new();
+    for group in groups {
+        let activities = collect_linked_events(
+            group.first,
+            group.event_count,
+            &links,
+            stripes,
+            &mut combined,
+        );
+        reducer.person_indexed(group.person, activities, clicks(group.person), &mut scratch);
+    }
+}
+
+pub(crate) fn aggregate_tile_indexed<'a, T: Copy + Ord + Into<i64> + 'a>(
+    runs: &[Run],
+    activity: &mut [Activity<T>],
+    clicks: &impl Fn(u64) -> &'a [Interaction<T>],
+    bases: (i64, i64),
+    categories: usize,
+    overflow_purchases: &[(u32, u32)],
+    compare_clicks: &impl Fn(u64, u64) -> Ordering,
+    user_days: &mut Vec<UserDay>,
+    campaign_days: &mut CampaignGrid,
+) {
+    let mut reducer = Reducer::new(
+        bases,
+        categories,
+        overflow_purchases,
+        compare_clicks,
+        user_days,
+        campaign_days,
+    );
+    let mut scratch = Vec::new();
+    for run in runs {
+        if run.person != 0 {
+            reducer.person_indexed(
+                run.person,
+                &mut activity[run.start..run.end],
+                clicks(run.person),
+                &mut scratch,
+            );
+        }
     }
 }
 
@@ -277,7 +370,7 @@ pub fn aggregate_tile<T: Copy + Ord + Into<i64>>(
     overflow_purchases: &[(u32, u32)],
     compare_clicks: &impl Fn(u64, u64) -> Ordering,
     user_days: &mut Vec<UserDay>,
-    campaign_days: &mut FastMap<(u32, i32), CampaignDay>,
+    campaign_days: &mut CampaignGrid,
 ) {
     #[derive(Clone, Copy, Default)]
     struct ClickRange {
@@ -500,7 +593,7 @@ struct Reducer<'a, Compare> {
     overflow_purchases: &'a [(u32, u32)],
     compare_clicks: &'a Compare,
     user_days: &'a mut Vec<UserDay>,
-    campaign_days: &'a mut FastMap<(u32, i32), CampaignDay>,
+    campaign_days: &'a mut CampaignGrid,
     sessions: Vec<Session>,
     category_totals: Vec<i64>,
     used_categories: Vec<u32>,
@@ -517,7 +610,7 @@ impl<'a, Compare: Fn(u64, u64) -> Ordering> Reducer<'a, Compare> {
         overflow_purchases: &'a [(u32, u32)],
         compare_clicks: &'a Compare,
         user_days: &'a mut Vec<UserDay>,
-        campaign_days: &'a mut FastMap<(u32, i32), CampaignDay>,
+        campaign_days: &'a mut CampaignGrid,
     ) -> Self {
         Self {
             bases,
@@ -554,15 +647,7 @@ impl<'a, Compare: Fn(u64, u64) -> Ordering> Reducer<'a, Compare> {
         events_sorted: bool,
         clicks_sorted: bool,
     ) {
-        self.sessions.clear();
-        if events_sorted || !self.options.bins || events.len() < 2_048 || !self.make_bins(events) {
-            if !events_sorted {
-                events.sort_unstable_by_key(|event| event.time);
-            }
-            self.from_sorted(person, events);
-        } else {
-            self.from_bins(person);
-        }
+        self.collect_sessions(person, events, events_sorted);
         if !clicks_sorted {
             clicks.sort_unstable_by_key(|click| click.time);
         }
@@ -574,6 +659,58 @@ impl<'a, Compare: Fn(u64, u64) -> Ordering> Reducer<'a, Compare> {
         if use_union {
             self.credit(clicks);
             self.assist_union(clicks);
+        } else if clicks.len() <= 12 {
+            self.credit_and_assist_small(clicks);
+        } else {
+            self.credit_and_assist_window(clicks);
+        }
+    }
+
+    fn collect_sessions<T: Copy + Ord + Into<i64>>(
+        &mut self,
+        person: u64,
+        events: &mut [Activity<T>],
+        events_sorted: bool,
+    ) {
+        self.sessions.clear();
+        if events_sorted || !self.options.bins || events.len() < 2_048 || !self.make_bins(events) {
+            if !events_sorted {
+                events.sort_unstable_by_key(|event| event.time);
+            }
+            self.from_sorted(person, events);
+        } else {
+            self.from_bins(person);
+        }
+    }
+
+    fn person_indexed<T: Copy + Ord + Into<i64>>(
+        &mut self,
+        person: u64,
+        events: &mut [Activity<T>],
+        clicks: &[Interaction<T>],
+        scratch: &mut Vec<Interaction<T>>,
+    ) {
+        let sorted = events.is_sorted_by_key(|event| event.time);
+        self.collect_sessions(person, events, sorted);
+        self.attribute_indexed(clicks, scratch);
+    }
+
+    /// The shared click index is time ordered. The interval-union strategy
+    /// takes a private copy because its secondary campaign sort is in place.
+    pub(crate) fn attribute_indexed<T: Copy + Ord + Into<i64>>(
+        &mut self,
+        clicks: &[Interaction<T>],
+        scratch: &mut Vec<Interaction<T>>,
+    ) {
+        let use_union = self.options.assist == Assist::Union
+            || (self.options.assist == Assist::Hybrid
+                && clicks.len() > 16
+                && self.sessions.len().saturating_mul(clicks.len()) > 512);
+        if use_union {
+            self.credit(clicks);
+            scratch.clear();
+            scratch.extend_from_slice(clicks);
+            self.assist_union(scratch);
         } else if clicks.len() <= 12 {
             self.credit_and_assist_small(clicks);
         } else {
@@ -887,22 +1024,88 @@ fn credited_campaign<T: Copy + Into<i64>>(
         .map_or(0, |click| click.campaign)
 }
 
-fn campaign_row(
-    rows: &mut FastMap<(u32, i32), CampaignDay>,
-    campaign: u32,
-    day: i32,
-) -> &mut CampaignDay {
-    rows.entry((campaign, day)).or_insert(CampaignDay {
-        campaign,
-        day,
-        sessions: 0,
-        purchasing_sessions: 0,
-        revenue: 0,
-        assisted_sessions: 0,
-    })
+#[derive(Clone, Copy, Default)]
+struct Totals {
+    sessions: u64,
+    purchasing_sessions: u64,
+    revenue: i64,
+    assisted_sessions: u64,
 }
 
-fn add_credit(rows: &mut FastMap<(u32, i32), CampaignDay>, campaign: u32, session: &Session) {
+#[derive(Default)]
+pub struct CampaignGrid {
+    start_day: i64,
+    width: usize,
+    cells: Vec<Totals>,
+    sparse: FastMap<(u32, i32), Totals>,
+}
+
+impl CampaignGrid {
+    pub fn new(start: i64, end: i64, campaigns: usize) -> Self {
+        let first = start.div_euclid(DAY);
+        let days = (end - 1).div_euclid(DAY) - first + 1;
+        let cells = usize::try_from(days)
+            .ok()
+            .and_then(|days| days.checked_mul(campaigns))
+            .filter(|&n| n <= 65_536)
+            .unwrap_or(0);
+        Self {
+            start_day: first,
+            width: campaigns,
+            cells: vec![Totals::default(); cells],
+            sparse: FastMap::default(),
+        }
+    }
+
+    pub fn into_rows(self) -> impl Iterator<Item = ((u32, i32), CampaignDay)> {
+        let Self {
+            start_day,
+            width,
+            cells,
+            sparse,
+        } = self;
+        let packed = cells
+            .into_iter()
+            .enumerate()
+            .filter_map(move |(at, totals)| {
+                if totals.sessions == 0 && totals.assisted_sessions == 0 {
+                    return None;
+                }
+                let key = (
+                    (at % width) as u32,
+                    (start_day + (at / width) as i64) as i32,
+                );
+                Some((key, totals))
+            });
+        packed.chain(sparse).map(|(key, totals)| {
+            (
+                key,
+                CampaignDay {
+                    campaign: key.0,
+                    day: key.1,
+                    sessions: totals.sessions,
+                    purchasing_sessions: totals.purchasing_sessions,
+                    revenue: totals.revenue,
+                    assisted_sessions: totals.assisted_sessions,
+                },
+            )
+        })
+    }
+}
+
+#[inline]
+fn campaign_row(rows: &mut CampaignGrid, campaign: u32, day: i32) -> &mut Totals {
+    let offset = i64::from(day) - rows.start_day;
+    if offset >= 0 && (campaign as usize) < rows.width && !rows.cells.is_empty() {
+        let at = offset as usize * rows.width + campaign as usize;
+        if at < rows.cells.len() {
+            return &mut rows.cells[at];
+        }
+    }
+    rows.sparse.entry((campaign, day)).or_default()
+}
+
+fn add_credit(rows: &mut CampaignGrid, campaign: u32, session: &Session) {
     let row = campaign_row(rows, campaign, session.day);
     row.sessions += 1;
     row.purchasing_sessions += u64::from(session.revenue != 0);
@@ -920,7 +1123,7 @@ mod run_tests {
 
     fn snapshot(
         users: Vec<UserDay>,
-        campaigns: FastMap<(u32, i32), CampaignDay>,
+        campaigns: CampaignGrid,
     ) -> (
         Vec<(u64, i32, u32, u32, i64, u32)>,
         Vec<(u32, i32, u64, u64, i64, u64)>,
@@ -930,7 +1133,8 @@ mod run_tests {
             .map(|r| (r.person, r.day, r.events, r.sessions, r.revenue, r.category))
             .collect();
         let mut campaigns: Vec<_> = campaigns
-            .into_values()
+            .into_rows()
+            .map(|(_, row)| row)
             .map(|r| {
                 (
                     r.campaign,
@@ -1021,7 +1225,7 @@ mod run_tests {
             let compare = |a: u64, b: u64| a.cmp(&b);
             let overflow = [(40_000_000, 3)];
             let mut expected_users = Vec::new();
-            let mut expected_campaigns = FastMap::default();
+            let mut expected_campaigns = CampaignGrid::default();
             let mut ranked_clicks = click_parts.clone();
             aggregate(
                 &mut event_parts,
@@ -1034,7 +1238,7 @@ mod run_tests {
                 &mut expected_campaigns,
             );
             let mut actual_users = Vec::new();
-            let mut actual_campaigns = FastMap::default();
+            let mut actual_campaigns = CampaignGrid::default();
             aggregate_runs(
                 &mut stripes,
                 &mut ranked_clicks,
@@ -1063,7 +1267,7 @@ mod run_tests {
             campaign: 17,
         }]];
         let mut users = Vec::new();
-        let mut campaigns = FastMap::default();
+        let mut campaigns = CampaignGrid::default();
         aggregate_runs(
             &mut stripes,
             &mut clicks,
@@ -1075,6 +1279,6 @@ mod run_tests {
             &mut campaigns,
         );
         assert!(users.is_empty());
-        assert!(campaigns.is_empty());
+        assert!(campaigns.into_rows().next().is_none());
     }
 }

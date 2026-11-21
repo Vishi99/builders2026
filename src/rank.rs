@@ -16,6 +16,11 @@ pub struct Layout {
 
 impl Layout {
     #[inline]
+    pub(crate) fn batch_parts(self) -> (u64, u64) {
+        (self.key, self.slots as u64)
+    }
+
+    #[inline]
     pub fn rank(&self, event_id: &[u8]) -> Option<usize> {
         self.rank_projected(projection(event_id, b'e')?)
     }

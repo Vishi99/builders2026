@@ -1,4 +1,6 @@
+use crate::aggregate::packed::{self, PackedRun, PackedTile};
 use crate::aggregate::{Activity, Run};
+use crate::click_index::{self, COMPACT_KEY};
 use crate::linkdir::{Canonical, LinkDirectory};
 use crate::rank::Layout;
 use crate::user_rank::UserLayout;
@@ -9,7 +11,10 @@ const TILE: usize = 1 << SHIFT;
 const MASK: usize = TILE - 1;
 const INGEST_BITS: usize = 21;
 const CODE_SHIFT: usize = SHIFT + INGEST_BITS;
-const COMPACT_KEY: u64 = 3 << 62;
+const SLOT_BITS: usize = 64 - SHIFT;
+const SLOT_PAYLOAD: u64 = (1 << SLOT_BITS) - 1;
+const SLOT_TAG: u64 = !(SLOT_PAYLOAD | (1 << 63));
+const SLOT_INGEST: u64 = (1 << INGEST_BITS) - 1;
 
 #[derive(Clone, Copy)]
 struct Ticket {
@@ -76,26 +81,81 @@ struct WideTicket {
     slot: u32,
 }
 
-#[derive(Clone, Copy)]
-struct Winner {
-    stamp: u64,
-    activity: Activity<u32>,
+const WIDE_WINNER: u64 = 1 << 63;
+const EMPTY_ACTIVITY: Activity<u32> = Activity {
+    time: 0,
+    purchase: 0,
+};
+
+struct WinnerSlots {
+    headers: Vec<u64>,
+    timestamps: Vec<u32>,
 }
 
-const WIDE_WINNER: u64 = 1 << 63;
-const EMPTY: Winner = Winner {
-    stamp: u64::MAX,
-    activity: Activity {
-        time: 0,
-        purchase: 0,
-    },
-};
+impl WinnerSlots {
+    fn new() -> Self {
+        Self {
+            headers: vec![0; TILE],
+            timestamps: vec![0; TILE],
+        }
+    }
+
+    #[inline]
+    fn update(&mut self, ticket: Ticket, tag: u64) {
+        let packed = ticket.packed();
+        let index = packed as usize & MASK;
+        let header = &mut self.headers[index];
+        let payload = packed >> SHIFT;
+        if *header & SLOT_TAG != tag || payload & SLOT_INGEST < *header & SLOT_INGEST {
+            *header = tag | payload;
+            self.timestamps[index] = ticket.time;
+        }
+    }
+
+    #[inline]
+    fn wide(&mut self, ticket: WideTicket, tag: u64, base: i64, exceptions: &mut Vec<WideTicket>) {
+        let header = &mut self.headers[ticket.slot as usize];
+        let ingest = if *header & SLOT_TAG != tag {
+            i64::MAX
+        } else if *header & WIDE_WINNER != 0 {
+            exceptions[(*header & SLOT_PAYLOAD) as usize].ingest
+        } else {
+            (base + (*header & SLOT_INGEST) as i64) * 1000
+        };
+        if ticket.ingest < ingest {
+            *header = tag | WIDE_WINNER | exceptions.len() as u64;
+            exceptions.push(ticket);
+        }
+    }
+
+    fn pairs<'a>(
+        &'a self,
+        tag: u64,
+        exceptions: &'a [WideTicket],
+    ) -> impl Iterator<Item = (u64, Activity<u32>)> + 'a {
+        self.headers
+            .iter()
+            .copied()
+            .zip(self.timestamps.iter().copied())
+            .filter_map(move |(header, time)| {
+                if header & SLOT_TAG != tag {
+                    return None;
+                }
+                let payload = header & SLOT_PAYLOAD;
+                if header & WIDE_WINNER != 0 {
+                    let event = exceptions[payload as usize];
+                    return (event.raw != 0).then_some((event.raw, event.activity));
+                }
+                let code = payload >> INGEST_BITS;
+                (code != 0).then_some((COMPACT_KEY | code, Activity { time, purchase: 0 }))
+            })
+    }
+}
 
 struct Staged {
     tiles: Vec<Tile>,
     wide: Vec<Vec<WideTicket>>,
     spill: Parts<CopyRecord<u32>>,
-    clicks: Batch<u32>,
     clock: csv::Clock,
 }
 
@@ -179,19 +239,19 @@ impl TileAtlas {
 }
 
 enum ReduceJob {
-    Local(RankTile, Vec<Vec<Click<u32>>>),
-    General(Vec<RankTile>, Vec<Vec<Click<u32>>>),
+    Local(PackedTile),
+    General(Vec<RankTile>),
 }
 
-fn append_exception(parts: &mut RunParts, person: u64, range: &[Activity<u32>]) {
-    let (runs, activities) = &mut parts[owner(person)];
+fn append_exception(parts: &mut RunParts, tile: &PackedTile, run: PackedRun) {
+    let (runs, activities) = &mut parts[owner(run.person)];
     let start = activities.len();
-    activities.extend_from_slice(range);
-    if let Some(last) = runs.last_mut().filter(|last| last.person == person) {
+    tile.extend_activities(run, activities);
+    if let Some(last) = runs.last_mut().filter(|last| last.person == run.person) {
         last.end = activities.len();
     } else {
         runs.push(Run {
-            person,
+            person: run.person,
             start,
             end: activities.len(),
         });
@@ -247,477 +307,373 @@ pub fn solve(
     output: &Path,
     timer: &mut Timer,
 ) -> io::Result<()> {
-    let links = OnceLock::new();
-    thread::scope(|scope| {
-        let task = scope.spawn(|| {
-            let mut timing = Timer(Instant::now());
-            let dir = LinkDirectory::build(link_files, users, data.names, threads.div_ceil(2));
-            let _ = links.set(dir);
-            timing.lap("  Build parallel exact link directory (overlapped)");
-        });
-        let tile_count = layout.slots.div_ceil(TILE);
-        let ingest_base = data.start.div_euclid(1000) - 86_400;
-        let batch_capacity = TILE.div_ceil(threads) * 5 / 4;
-        let batches = work(
-            event_chunks.len() + click_chunks.len(),
-            threads,
-            || Staged {
-                tiles: (0..tile_count).map(|_| Tile::new()).collect(),
-                wide: (0..tile_count).map(|_| Vec::new()).collect(),
-                spill: array::from_fn(|_| Vec::new()),
-                clicks: Batch::new(0),
-                clock: csv::Clock::new(),
-            },
-            |index, batch| {
-                if index >= event_chunks.len() {
-                    scan_clicks(
-                        &data,
-                        users,
-                        links.get(),
-                        click_chunks[index - event_chunks.len()],
-                        batch,
-                    );
+    let tile_count = layout.slots.div_ceil(TILE);
+    let ingest_base = data.start.div_euclid(1000) - 86_400;
+    let batch_capacity = TILE.div_ceil(threads) * 5 / 4;
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    let use_batch_scan = std::env::var_os("J2_BATCH_SCAN").is_some();
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    let window = crate::event_batch::Window {
+        start: data.start,
+        end: data.end,
+        ingest_base,
+    };
+    let (batches, aliases, clicks) = click_index::scan(
+        &data,
+        users,
+        link_files,
+        click_chunks,
+        event_chunks.len(),
+        threads,
+        || Staged {
+            tiles: (0..tile_count).map(|_| Tile::new()).collect(),
+            wide: (0..tile_count).map(|_| Vec::new()).collect(),
+            spill: array::from_fn(|_| Vec::new()),
+            clock: csv::Clock::new(),
+        },
+        |index, batch| {
+            let exact = |batch: &mut Staged, row: csv::EventRow<'_, '_>| {
+                let id = row.field::<0>();
+                if id.is_empty() {
                     return;
                 }
-                csv::event_rows(event_chunks[index], |row| {
-                    let id = row.field::<0>();
-                    if id.is_empty() {
-                        return;
+                let Some(ingest) = batch.clock.timestamp(row.field::<3>()) else {
+                    return;
+                };
+                let payload = data
+                    .event_fields(&row, &mut batch.clock)
+                    .filter(|&(time, _)| ingest.saturating_sub(time) <= DAY);
+                let activity = payload.map_or(EMPTY_ACTIVITY, |(time, purchase)| Activity {
+                    time: (time - data.start) as u32,
+                    purchase,
+                });
+                let (code, rank) = if payload.is_none() {
+                    (Some(0), layout.rank(id))
+                } else {
+                    let user = row.field::<1>();
+                    if let Some((event, person)) = crate::rank::projected_pair(id, user) {
+                        (users.encode_projected(person), layout.rank_projected(event))
+                    } else {
+                        (users.encode(user), layout.rank(id))
                     }
-                    let Some(ingest) = batch.clock.timestamp(row.field::<3>()) else {
-                        return;
-                    };
-                    let payload = data
-                        .event_fields(&row, &mut batch.clock)
-                        .filter(|&(time, _)| ingest.saturating_sub(time) <= DAY);
-                    let activity = payload.map_or(EMPTY.activity, |(time, purchase)| Activity {
-                        time: (time - data.start) as u32,
-                        purchase,
-                    });
-                    let (code, rank) = if payload.is_none() {
-                        (Some(0), layout.rank(id))
-                    } else {
-                        let user = row.field::<1>();
-                        if let Some((event, person)) = crate::rank::projected_pair(id, user) {
-                            (users.encode_projected(person), layout.rank_projected(event))
-                        } else {
-                            (users.encode(user), layout.rank(id))
-                        }
-                    };
-                    let raw = || match code {
-                        Some(0) => 0,
-                        Some(code) => COMPACT_KEY | u64::from(code),
-                        None => data.names.key(row.field::<1>()),
-                    };
-                    if let Some(rank) = rank {
-                        let tile = rank >> SHIFT;
-                        let slot = (rank & MASK) as u32;
-                        let stamp = (ingest.div_euclid(1000) - ingest_base) as u64;
-                        if let Some(code) =
-                            code.filter(|&code| u64::from(code) < 1 << (64 - CODE_SHIFT))
+                };
+                let raw = || match code {
+                    Some(0) => 0,
+                    Some(code) => COMPACT_KEY | u64::from(code),
+                    None => data.names.key(row.field::<1>()),
+                };
+                if let Some(rank) = rank {
+                    let tile = rank >> SHIFT;
+                    let slot = (rank & MASK) as u32;
+                    let stamp = (ingest.div_euclid(1000) - ingest_base) as u64;
+                    if let Some(code) =
+                        code.filter(|&code| u64::from(code) < 1 << (64 - CODE_SHIFT))
+                    {
+                        if stamp < (1 << INGEST_BITS)
+                            && ingest % 1000 == 0
+                            && activity.purchase == 0
                         {
-                            if stamp < (1 << INGEST_BITS)
-                                && ingest % 1000 == 0
-                                && activity.purchase == 0
-                            {
-                                let packed = u64::from(slot)
-                                    | (stamp << SHIFT)
-                                    | (u64::from(code) << CODE_SHIFT);
-                                batch.tiles[tile].push(
-                                    Ticket {
-                                        low: packed as u32,
-                                        high: (packed >> 32) as u32,
-                                        time: activity.time,
-                                    },
-                                    batch_capacity,
-                                );
-                                return;
-                            }
+                            let packed = u64::from(slot)
+                                | (stamp << SHIFT)
+                                | (u64::from(code) << CODE_SHIFT);
+                            batch.tiles[tile].push(
+                                Ticket {
+                                    low: packed as u32,
+                                    high: (packed >> 32) as u32,
+                                    time: activity.time,
+                                },
+                                batch_capacity,
+                            );
+                            return;
                         }
-                        batch.wide[tile].push(WideTicket {
-                            raw: raw(),
-                            activity,
-                            slot,
-                            ingest,
-                        });
-                    } else {
-                        let raw = raw();
-                        let id = ordered_event_key(id, &data.ids);
-                        let event = Event {
-                            person: raw,
-                            time: activity.time,
-                            purchase: activity.purchase,
-                        };
-                        batch.spill[id as usize & (LANES - 1)].push(CopyRecord {
-                            id,
-                            ingest,
-                            event,
-                        });
+                    }
+                    batch.wide[tile].push(WideTicket {
+                        raw: raw(),
+                        activity,
+                        slot,
+                        ingest,
+                    });
+                } else {
+                    let raw = raw();
+                    let id = ordered_event_key(id, &data.ids);
+                    let event = Event {
+                        person: raw,
+                        time: activity.time,
+                        purchase: activity.purchase,
+                    };
+                    batch.spill[id as usize & (LANES - 1)].push(CopyRecord { id, ingest, event });
+                }
+            };
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            if use_batch_scan {
+                crate::event_batch::scan(event_chunks[index], &window, layout, users, |hit| {
+                    match hit {
+                        crate::event_batch::Hit::Exact(row) => exact(batch, row),
+                        crate::event_batch::Hit::Packed {
+                            rank,
+                            code,
+                            time,
+                            stamp,
+                        } => {
+                            let packed = (rank & MASK) as u64
+                                | (u64::from(stamp) << SHIFT)
+                                | (u64::from(code) << CODE_SHIFT);
+                            batch.tiles[rank >> SHIFT].push(
+                                Ticket {
+                                    low: packed as u32,
+                                    high: (packed >> 32) as u32,
+                                    time,
+                                },
+                                batch_capacity,
+                            );
+                        }
                     }
                 });
-            },
-        );
-        timer.lap("Validate and stage ordinal ranges and clicks");
-        let mut tiles: Vec<Vec<_>> = (0..tile_count).map(|_| Vec::new()).collect();
-        let mut wide: Vec<Vec<_>> = (0..tile_count).map(|_| Vec::new()).collect();
-        let mut spilled = Vec::new();
-        let (mut early_clicks, mut late_clicks) = (Vec::new(), Vec::new());
-        for batch in batches {
-            for (stripes, tickets) in tiles.iter_mut().zip(batch.tiles) {
-                if !tickets.is_empty() {
-                    stripes.push(tickets);
-                }
+                return;
             }
-            for (stripes, tickets) in wide.iter_mut().zip(batch.wide) {
-                if !tickets.is_empty() {
-                    stripes.push(tickets);
-                }
+            csv::event_rows(event_chunks[index], |row| exact(batch, row));
+        },
+    );
+    timer.lap("Scan ranked events and publish sorted click ranges");
+    let mut tiles: Vec<Vec<_>> = (0..tile_count).map(|_| Vec::new()).collect();
+    let mut wide: Vec<Vec<_>> = (0..tile_count).map(|_| Vec::new()).collect();
+    let mut spilled = Vec::new();
+    for batch in batches {
+        for (stripes, tickets) in tiles.iter_mut().zip(batch.tiles) {
+            if !tickets.is_empty() {
+                stripes.push(tickets);
             }
-            spilled.push(batch.spill);
-            early_clicks.push(batch.clicks.clicks);
-            late_clicks.push(batch.clicks.pending_clicks);
         }
-        task.join().unwrap();
-        timer.lap("Wait for links");
-        let aliases = links.get().unwrap();
-        let tiles: Vec<_> = tiles
-            .into_iter()
-            .zip(wide)
-            .filter(|(a, b)| !a.is_empty() || !b.is_empty())
-            .map(|tile| Mutex::new(Some(tile)))
-            .collect();
-        let spill: Vec<_> = stripes(spilled)
-            .into_iter()
-            .filter(|stripes| !stripes.is_empty())
-            .map(|stripes| Mutex::new(Some(stripes)))
-            .collect();
-        let atlas = TileAtlas::new(aliases.layout.groups);
-        let tile_out: Vec<_> = (0..tiles.len())
-            .map(|_| Mutex::new(None::<RankTile>))
-            .collect();
-        let exceptions = work(
-            tiles.len() + spill.len(),
-            threads,
-            || {
-                (
-                    array::from_fn(|_| (Vec::new(), Vec::new())),
-                    vec![EMPTY; TILE],
-                    vec![ZERO_CACHE; 8192],
-                    Vec::<WideTicket>::new(),
-                )
-            },
-            |index, (exceptions, slots, cache, exceptional)| {
-                if index < tiles.len() {
-                    slots.fill(EMPTY);
-                    let (stripes, wide) = tiles[index].lock().unwrap().take().unwrap();
-                    for stripe in stripes {
-                        let mut take = |ticket: Ticket| {
-                            let packed = ticket.packed();
-                            let winner = &mut slots[packed as usize & MASK];
-                            let stamp = (packed >> SHIFT) & ((1 << INGEST_BITS) - 1);
-                            if winner.stamp == u64::MAX
-                                || stamp < (winner.stamp & ((1 << INGEST_BITS) - 1))
-                            {
-                                *winner = Winner {
-                                    stamp: packed >> SHIFT,
-                                    activity: Activity {
-                                        time: ticket.time,
-                                        purchase: 0,
-                                    },
-                                };
-                            }
-                        };
-                        for bundle in stripe.filled {
-                            for ticket in bundle.0 {
-                                take(ticket);
-                            }
-                        }
-                        for &ticket in &stripe.pending[..stripe.count] {
-                            take(ticket);
+        for (stripes, tickets) in wide.iter_mut().zip(batch.wide) {
+            if !tickets.is_empty() {
+                stripes.push(tickets);
+            }
+        }
+        spilled.push(batch.spill);
+    }
+    let aliases = &aliases;
+    let tiles: Vec<_> = tiles
+        .into_iter()
+        .zip(wide)
+        .filter(|(a, b)| !a.is_empty() || !b.is_empty())
+        .map(|tile| Mutex::new(Some(tile)))
+        .collect();
+    let spill: Vec<_> = stripes(spilled)
+        .into_iter()
+        .filter(|stripes| !stripes.is_empty())
+        .map(|stripes| Mutex::new(Some(stripes)))
+        .collect();
+    let atlas = TileAtlas::new(aliases.layout.groups);
+    let tile_out: Vec<_> = (0..tiles.len())
+        .map(|_| Mutex::new(None::<PackedTile>))
+        .collect();
+    let exceptions = work(
+        tiles.len() + spill.len(),
+        threads,
+        || {
+            (
+                array::from_fn(|_| (Vec::new(), Vec::new())),
+                WinnerSlots::new(),
+                vec![ZERO_CACHE; 8192],
+                Vec::<WideTicket>::new(),
+            )
+        },
+        |index, (exceptions, slots, cache, exceptional)| {
+            if index < tiles.len() {
+                let tag = ((index + 1) as u64) << SLOT_BITS;
+                let (stripes, wide) = tiles[index].lock().unwrap().take().unwrap();
+                for stripe in stripes {
+                    for bundle in stripe.filled {
+                        for ticket in bundle.0 {
+                            slots.update(ticket, tag);
                         }
                     }
-                    exceptional.clear();
-                    for stripe in wide {
-                        for ticket in stripe {
-                            let winner = &mut slots[ticket.slot as usize];
-                            let ingest = match winner.stamp {
-                                u64::MAX => i64::MAX,
-                                index if index >= WIDE_WINNER => {
-                                    exceptional[(index ^ WIDE_WINNER) as usize].ingest
-                                }
-                                stamp => {
-                                    (ingest_base + (stamp & ((1 << INGEST_BITS) - 1)) as i64) * 1000
-                                }
-                            };
-                            if ticket.ingest < ingest {
-                                let index = exceptional.len();
-                                *winner = Winner {
-                                    stamp: WIDE_WINNER | index as u64,
-                                    activity: ticket.activity,
-                                };
-                                exceptional.push(ticket);
-                            }
-                        }
+                    for &ticket in &stripe.pending[..stripe.count] {
+                        slots.update(ticket, tag);
                     }
-                    let mut current = ZERO_CACHE;
-                    let mut ranges = Vec::<Run>::with_capacity(TILE / 24);
-                    let mut activity = Vec::with_capacity(TILE);
-                    for winner in slots.iter() {
-                        let raw = match winner.stamp {
-                            u64::MAX => continue,
-                            index if index >= WIDE_WINNER => {
-                                exceptional[(index ^ WIDE_WINNER) as usize].raw
-                            }
-                            stamp => {
-                                let code = stamp >> INGEST_BITS;
-                                if code == 0 {
-                                    continue;
-                                }
-                                COMPACT_KEY | code
-                            }
-                        };
+                }
+                exceptional.clear();
+                for stripe in wide {
+                    for ticket in stripe {
+                        slots.wide(ticket, tag, ingest_base, exceptional);
+                    }
+                }
+                let mut current = ZERO_CACHE;
+                let mut tile_outcome = PackedTile::with_capacity(TILE);
+                let mut last_person = 0;
+                for (raw, event) in slots.pairs(tag, exceptional) {
+                    if current.raw != raw {
+                        current = canonical(raw, cache, aliases, data.names);
+                    }
+                    if current.person != last_person {
+                        let run = tile_outcome.begin_run(current.person);
+                        atlas.record(current.person, index, run);
+                        last_person = current.person;
+                    }
+                    tile_outcome.push(event);
+                }
+                tile_outcome.seal_run();
+                *tile_out[index].lock().unwrap() = Some(tile_outcome);
+            } else {
+                let mut stripes = spill[index - tiles.len()].lock().unwrap().take().unwrap();
+                let count = stripes.iter().map(Vec::len).sum();
+                dense_winners(&mut stripes, count);
+                for stripe in stripes {
+                    for ticket in stripe {
+                        let Event {
+                            person: raw,
+                            time,
+                            purchase,
+                        } = ticket.event;
                         if raw != 0 {
-                            if current.raw != raw {
-                                current = canonical(raw, cache, aliases, data.names);
-                            }
-                            let start = activity.len();
-                            if let Some(last) = ranges
-                                .last_mut()
-                                .filter(|last| last.person == current.person)
-                            {
-                                last.end += 1;
-                            } else {
-                                atlas.record(current.person, index, ranges.len());
-                                ranges.push(Run {
-                                    person: current.person,
-                                    start,
-                                    end: start + 1,
-                                });
-                            }
-                            activity.push(winner.activity);
+                            let key = canonical(raw, cache, aliases, data.names);
+                            atlas.exception(key.person);
+                            push_run(exceptions, key, Activity { time, purchase });
                         }
                     }
-                    *tile_out[index].lock().unwrap() = Some((ranges, activity));
-                } else {
-                    let mut stripes = spill[index - tiles.len()].lock().unwrap().take().unwrap();
-                    let count = stripes.iter().map(Vec::len).sum();
-                    dense_winners(&mut stripes, count);
-                    for stripe in stripes {
-                        for ticket in stripe {
-                            let Event {
-                                person: raw,
-                                time,
-                                purchase,
-                            } = ticket.event;
-                            if raw != 0 {
-                                let key = canonical(raw, cache, aliases, data.names);
-                                atlas.exception(key.person);
-                                push_run(exceptions, key, Activity { time, purchase });
-                            }
-                        }
-                    }
-                }
-            },
-        );
-        timer.lap("Arbitrate ordinal winners and mark exact tile residency");
-        let mut fallback: Vec<Vec<RankTile>> = (0..LANES).map(|_| Vec::new()).collect();
-        for (parts, _, _, _) in exceptions {
-            collect_exception_runs(parts, &mut fallback);
-        }
-        let click_jobs: Vec<_> = early_clicks
-            .into_iter()
-            .map(|part| (part, false))
-            .chain(late_clicks.into_iter().map(|part| (part, true)))
-            .flat_map(|(part, raw)| {
-                part.into_iter()
-                    .filter(|clicks| !clicks.is_empty())
-                    .map(move |clicks| Mutex::new(Some((clicks, raw))))
-            })
-            .collect();
-        let routed = work(
-            tile_out.len() + click_jobs.len(),
-            threads,
-            || {
-                (
-                    array::from_fn(|_| (Vec::new(), Vec::new())),
-                    array::from_fn(|_| Vec::new()),
-                    (0..tile_out.len()).map(|_| Vec::new()).collect::<Vec<_>>(),
-                    vec![ZERO_CACHE; 8192],
-                )
-            },
-            |index, (exceptions, excess_clicks, tile_clicks, cache)| {
-                if index < tile_out.len() {
-                    let mut tile = tile_out[index].lock().unwrap();
-                    let (runs, events) = tile.as_mut().unwrap();
-                    for (at, run) in runs.iter_mut().enumerate() {
-                        let stays_here = matches!(
-                            atlas.placement(run.person),
-                            Placement::Tile { tile, run } if tile == index && run == at
-                        );
-                        if !stays_here {
-                            append_exception(exceptions, run.person, &events[run.start..run.end]);
-                            run.person = 0;
-                        }
-                    }
-                } else {
-                    let (clicks, raw) = click_jobs[index - tile_out.len()]
-                        .lock()
-                        .unwrap()
-                        .take()
-                        .unwrap();
-                    for mut click in clicks {
-                        if raw {
-                            click.person =
-                                canonical(click.person, cache, aliases, data.names).person;
-                        }
-                        match atlas.placement(click.person) {
-                            Placement::Absent => {}
-                            Placement::Exception => excess_clicks[owner(click.person)].push(click),
-                            Placement::Tile { tile, run } => {
-                                click.person = run as u64;
-                                tile_clicks[tile].push(click);
-                            }
-                        }
-                    }
-                }
-            },
-        );
-        timer.lap("Route clicks and exact exceptions to their owners");
-        let mut tile_clicks: Vec<Vec<_>> = (0..tile_out.len()).map(|_| Vec::new()).collect();
-        let mut fallback_clicks = Vec::new();
-        for (parts, clicks, direct_clicks, _) in routed {
-            collect_exception_runs(parts, &mut fallback);
-            fallback_clicks.push(clicks);
-            for (stripe, clicks) in tile_clicks.iter_mut().zip(direct_clicks) {
-                if !clicks.is_empty() {
-                    stripe.push(clicks);
                 }
             }
-        }
-        let jobs: Vec<_> = fallback
+        },
+    );
+    timer.lap("Arbitrate ordinal winners and mark exact tile residency");
+    let mut fallback: Vec<Vec<RankTile>> = (0..LANES).map(|_| Vec::new()).collect();
+    for (parts, _, _, _) in exceptions {
+        collect_exception_runs(parts, &mut fallback);
+    }
+    let routed = work(
+        tile_out.len(),
+        threads,
+        || -> RunParts { array::from_fn(|_| (Vec::new(), Vec::new())) },
+        |index, exceptions| {
+            let mut tile = tile_out[index].lock().unwrap();
+            let tile = tile.as_mut().unwrap();
+            for at in 0..tile.runs.len() {
+                let run = tile.runs[at];
+                let stays_here = matches!(
+                    atlas.placement(run.person),
+                    Placement::Tile { tile, run } if tile == index && run == at
+                );
+                if !stays_here {
+                    append_exception(exceptions, tile, run);
+                    tile.runs[at].person = 0;
+                }
+            }
+        },
+    );
+    timer.lap("Route exact event exceptions");
+    for parts in routed {
+        collect_exception_runs(parts, &mut fallback);
+    }
+    let jobs: Vec<_> =
+        fallback
             .into_iter()
-            .zip(stripes(fallback_clicks))
-            .filter(|(runs, _)| !runs.is_empty())
-            .map(|(runs, clicks)| Mutex::new(Some(ReduceJob::General(runs, clicks))))
-            .chain(tile_out.into_iter().zip(tile_clicks).map(|(tile, clicks)| {
-                Mutex::new(Some(ReduceJob::Local(
-                    tile.into_inner().unwrap().unwrap(),
-                    clicks,
-                )))
+            .filter(|runs| !runs.is_empty())
+            .map(|runs| Mutex::new(Some(ReduceJob::General(runs))))
+            .chain(tile_out.into_iter().map(|tile| {
+                Mutex::new(Some(ReduceJob::Local(tile.into_inner().unwrap().unwrap())))
             }))
             .collect();
-        let overflow = data.overflow.into_inner().unwrap();
-        let sequence = AtomicUsize::new(0);
-        let append = |key: u64, out: &mut Vec<u8>| {
-            if key & COMPACT_KEY == COMPACT_KEY {
-                users.append(key as u32, out);
-            } else {
-                data.names.append(key, out);
-            }
-        };
-        let by_worker = work(
-            jobs.len(),
-            threads,
-            || {
-                (
-                    Vec::new(),
-                    FastMap::default(),
-                    output::UserWriter::open(output, sequence.fetch_add(1, Ordering::Relaxed)),
-                )
-            },
-            |index, (users, campaigns, writer)| {
-                let Ok(writer_inner) = writer else { return };
-                let bases = (data.start, data.start - WEEK);
-                let categories = data.dimensions.categories.len();
-                let compare = |a, b| data.click_ids.compare(a, b);
-                match jobs[index].lock().unwrap().take().unwrap() {
-                    ReduceJob::Local((runs, mut activity), mut clicks) => {
-                        aggregate::aggregate_tile(
-                            &runs,
-                            &mut activity,
-                            &mut clicks,
-                            bases,
-                            categories,
-                            &overflow,
-                            &compare,
-                            users,
-                            campaigns,
-                        );
-                    }
-                    ReduceJob::General(mut runs, mut clicks) => {
-                        aggregate::aggregate_runs(
-                            &mut runs,
-                            &mut clicks,
-                            bases,
-                            categories,
-                            &overflow,
-                            &compare,
-                            users,
-                            campaigns,
-                        );
-                    }
-                }
-                if users.len() >= 65_536 {
-                    if let Err(error) =
-                        writer_inner.append(users, &append, &data.dimensions.categories)
-                    {
-                        *writer = Err(error);
-                    }
-                    users.clear();
-                }
-            },
-        );
-        timer.lap("Reduce resident tiles and stream user output");
-        let mut campaign = FastMap::<(u32, i32), CampaignDay>::default();
-        let jobs: Vec<_> = by_worker
-            .into_iter()
-            .map(|(rows, campaigns, writer)| {
-                for (key, row) in campaigns {
-                    let total = campaign.entry(key).or_insert(CampaignDay {
-                        campaign: key.0,
-                        day: key.1,
-                        ..CampaignDay::default()
-                    });
-                    total.sessions += row.sessions;
-                    total.purchasing_sessions += row.purchasing_sessions;
-                    total.revenue += row.revenue;
-                    total.assisted_sessions += row.assisted_sessions;
-                }
-                Mutex::new(Some((rows, writer)))
-            })
-            .collect();
-        let campaign: Vec<_> = campaign.into_values().collect();
-        let outcomes = work(
-            jobs.len() + 1,
-            threads,
-            || Ok(()),
-            |index, state| {
-                if state.is_err() {
-                    return;
-                }
-                *state = if index == jobs.len() {
-                    output::write_campaigns(
-                        output,
-                        &campaign,
-                        &data.dimensions.campaign_ids,
-                        &data.dimensions.channels,
-                    )
-                } else {
-                    (|| {
-                        let (rows, writer) = jobs[index].lock().unwrap().take().unwrap();
-                        let mut writer = writer?;
-                        writer.append(&rows, &append, &data.dimensions.categories)?;
-                        writer.finish()
-                    })()
-                };
-            },
-        );
-        for outcome in outcomes {
-            outcome?;
+    let click_for = |person| clicks.get(person);
+    let overflow = data.overflow.into_inner().unwrap();
+    let sequence = AtomicUsize::new(0);
+    let append = |key: u64, out: &mut Vec<u8>| {
+        if key & COMPACT_KEY == COMPACT_KEY {
+            users.append(key as u32, out);
+        } else {
+            data.names.append(key, out);
         }
-        timer.lap("Finalize both Parquet tables");
-        Ok(())
-    })
+    };
+    let by_worker = work(
+        jobs.len(),
+        threads,
+        || {
+            (
+                Vec::new(),
+                aggregate::CampaignGrid::new(
+                    data.start,
+                    data.end,
+                    data.dimensions.campaign_ids.len(),
+                ),
+                output::UserWriter::open(output, sequence.fetch_add(1, Ordering::Relaxed)),
+            )
+        },
+        |index, (users, campaigns, writer)| {
+            let Ok(writer_inner) = writer else { return };
+            let bases = (data.start, data.start - WEEK);
+            let categories = data.dimensions.categories.len();
+            let compare = |a, b| data.click_ids.compare(a, b);
+            match jobs[index].lock().unwrap().take().unwrap() {
+                ReduceJob::Local(tile) => {
+                    packed::aggregate_tile_indexed(
+                        &tile, &click_for, bases, categories, &overflow, &compare, users, campaigns,
+                    );
+                }
+                ReduceJob::General(mut runs) => {
+                    aggregate::aggregate_runs_indexed(
+                        &mut runs, &click_for, bases, categories, &overflow, &compare, users,
+                        campaigns,
+                    );
+                }
+            }
+            if users.len() >= 65_536 {
+                if let Err(error) = writer_inner.append(users, &append, &data.dimensions.categories)
+                {
+                    *writer = Err(error);
+                }
+                users.clear();
+            }
+        },
+    );
+    timer.lap("Reduce resident tiles and stream user output");
+    let mut campaign = FastMap::<(u32, i32), CampaignDay>::default();
+    let jobs: Vec<_> = by_worker
+        .into_iter()
+        .map(|(rows, campaigns, writer)| {
+            for (key, row) in campaigns.into_rows() {
+                let total = campaign.entry(key).or_insert(CampaignDay {
+                    campaign: key.0,
+                    day: key.1,
+                    ..CampaignDay::default()
+                });
+                total.sessions += row.sessions;
+                total.purchasing_sessions += row.purchasing_sessions;
+                total.revenue += row.revenue;
+                total.assisted_sessions += row.assisted_sessions;
+            }
+            Mutex::new(Some((rows, writer)))
+        })
+        .collect();
+    let campaign: Vec<_> = campaign.into_values().collect();
+    let outcomes = work(
+        jobs.len() + 1,
+        threads,
+        || Ok(()),
+        |index, state| {
+            if state.is_err() {
+                return;
+            }
+            *state = if index == jobs.len() {
+                output::write_campaigns(
+                    output,
+                    &campaign,
+                    &data.dimensions.campaign_ids,
+                    &data.dimensions.channels,
+                )
+            } else {
+                (|| {
+                    let (rows, writer) = jobs[index].lock().unwrap().take().unwrap();
+                    let mut writer = writer?;
+                    writer.append(&rows, &append, &data.dimensions.categories)?;
+                    writer.finish()
+                })()
+            };
+        },
+    );
+    for outcome in outcomes {
+        outcome?;
+    }
+    timer.lap("Finalize both Parquet tables");
+    Ok(())
 }
 
 #[inline]
@@ -729,44 +685,4 @@ fn resolve(raw: u64, aliases: &LinkDirectory, names: &Names) -> u64 {
         Canonical::Code(code) => COMPACT_KEY | u64::from(code),
         Canonical::Wide(raw) => raw,
     }
-}
-
-fn scan_clicks(
-    data: &Dataset<'_>,
-    users: UserLayout,
-    links: Option<&LinkDirectory>,
-    input: &[u8],
-    batch: &mut Staged,
-) {
-    let base = data.start - WEEK;
-    csv::rows::<4>(input, |[id, user, campaign, stamp]| {
-        if id.is_empty() || user.is_empty() {
-            return;
-        }
-        let Some(&campaign) = data.dimensions.campaigns.get(campaign) else {
-            return;
-        };
-        let Some(stamp) = batch.clock.timestamp(stamp) else {
-            return;
-        };
-        if !(base..data.end).contains(&stamp) {
-            return;
-        }
-        let raw = if let Some(code) = users.encode(user) {
-            COMPACT_KEY | u64::from(code)
-        } else {
-            data.names.key(user)
-        };
-        let (person, output) = if let Some(links) = links {
-            (resolve(raw, links, data.names), &mut batch.clicks.clicks)
-        } else {
-            (raw, &mut batch.clicks.pending_clicks)
-        };
-        output[owner(person)].push(Click {
-            person,
-            id: data.click_ids.key(id),
-            time: (stamp - base) as u32,
-            campaign,
-        });
-    });
 }

@@ -1,5 +1,7 @@
 mod aggregate;
+mod click_index;
 mod csv;
+mod event_batch;
 mod keys;
 mod linkdir;
 mod output;
@@ -789,10 +791,19 @@ fn solve<T: Copy + Send + Ord + Into<i64> + TryFrom<i64>>(
         .zip(clicks)
         .map(|pair| Mutex::new(Some(pair)))
         .collect();
-    let by_worker: Vec<(Vec<UserDay>, FastMap<(u32, i32), CampaignDay>)> = work(
+    let by_worker: Vec<(Vec<UserDay>, aggregate::CampaignGrid)> = work(
         jobs.len(),
         threads,
-        || (Vec::new(), FastMap::default()),
+        || {
+            (
+                Vec::new(),
+                aggregate::CampaignGrid::new(
+                    data.start,
+                    data.end,
+                    data.dimensions.campaign_ids.len(),
+                ),
+            )
+        },
         |index, result| {
             let (mut events, mut clicks) = jobs[index].lock().unwrap().take().unwrap();
             aggregate::aggregate(
@@ -819,7 +830,7 @@ fn solve<T: Copy + Send + Ord + Into<i64> + TryFrom<i64>>(
 }
 
 fn write_results(
-    by_worker: Vec<(Vec<UserDay>, FastMap<(u32, i32), CampaignDay>)>,
+    by_worker: Vec<(Vec<UserDay>, aggregate::CampaignGrid)>,
     append_name: &(impl Fn(u64, &mut Vec<u8>) + Sync),
     dimensions: &Dimensions,
     threads: usize,
@@ -832,7 +843,7 @@ fn write_results(
         if !users.is_empty() {
             user_parts.push(users);
         }
-        for (key, value) in campaigns {
+        for (key, value) in campaigns.into_rows() {
             let total = campaign.entry(key).or_insert(CampaignDay {
                 campaign: key.0,
                 day: key.1,
