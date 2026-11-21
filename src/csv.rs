@@ -444,7 +444,8 @@ fn eight_digits(raw: u64) -> Option<u32> {
 fn milliseconds(bytes: &[u8]) -> Option<i64> {
     if bytes.len() == 13 {
         let head = eight_digits(u64::from_le_bytes(bytes[..8].try_into().ok()?))?;
-        return Some(i64::from(head) * 100_000 + i64::from(decimal(&bytes[8..], 99_999)?));
+        let tail = eight_digits(u64::from_le_bytes(bytes[5..].try_into().ok()?))? % 100_000;
+        return Some(i64::from(head) * 100_000 + i64::from(tail));
     }
     if bytes.is_empty() {
         return None;
@@ -686,19 +687,39 @@ fn event_fields(bytes: &[u8], first: Block, second: Block) -> Option<EventRow<'_
         begins as u8
     };
 
-    let mut cuts = (length as u64) << 48;
-    for i in 0..6 {
-        let end = if c0 != 0 {
-            let position = c0.trailing_zeros();
-            c0 &= c0 - 1;
-            position
-        } else {
-            let position = c1.trailing_zeros() + 64;
-            c1 &= c1 - 1;
-            position
-        };
-        cuts |= u64::from(end) << (8 * i);
+    #[inline(always)]
+    fn pull(mask: &mut u64) -> u64 {
+        let i = u64::from(mask.trailing_zeros());
+        *mask &= mask.wrapping_sub(1);
+        i
     }
+    #[inline(always)]
+    fn bulk<const N: usize>(mut mask: u64) -> u64 {
+        let mut cuts = 0;
+        for i in 0..N {
+            cuts |= pull(&mut mask) << (8 * i);
+        }
+        cuts
+    }
+
+    let cuts = if n0 >= 3 {
+        // Compute each half's offsets independently. Only the count of the
+        // low-half delimiters is needed to stitch the two packed fields.
+        let low = bulk::<6>(c0) & ((1u64 << (8 * n0)) - 1);
+        let high = (bulk::<3>(c1) | 0x0040_4040) << (8 * n0);
+        (low | high) & 0xffff_ffff_ffff | ((length as u64) << 48)
+    } else {
+        let mut cuts = (length as u64) << 48;
+        for i in 0..6 {
+            let end = if c0 != 0 {
+                pull(&mut c0)
+            } else {
+                pull(&mut c1) + 64
+            };
+            cuts |= end << (8 * i);
+        }
+        cuts
+    };
     Some(EventRow(EventFields::Short {
         bytes,
         cuts,

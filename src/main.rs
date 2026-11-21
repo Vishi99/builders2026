@@ -1,7 +1,11 @@
 mod aggregate;
 mod csv;
 mod keys;
+mod linkdir;
 mod output;
+mod rank;
+mod ranked;
+mod user_rank;
 
 use aggregate::{Click, Event};
 use keys::{event_signature, ordered_event_key, spread, FastMap, Names};
@@ -60,11 +64,74 @@ fn work<R: Send>(
     })
 }
 
+struct DimensionIds<const PREFIX: u16> {
+    dense: Vec<u32>,
+    sparse: FastMap<Vec<u8>, u32>,
+}
+
+impl<const PREFIX: u16> DimensionIds<PREFIX> {
+    fn new() -> Self {
+        Self {
+            dense: Vec::new(),
+            sparse: FastMap::default(),
+        }
+    }
+
+    #[inline]
+    fn code(id: &[u8]) -> Option<usize> {
+        let first = (PREFIX >> 8) as u8;
+        let second = PREFIX as u8;
+        let suffix = if second != 0 {
+            if id.len() < 3 || id[0] != first || id[1] != second {
+                return None;
+            }
+            &id[2..]
+        } else {
+            if id.len() < 2 || id[0] != first {
+                return None;
+            }
+            &id[1..]
+        };
+        if suffix.len() > 5 || (suffix[0] == b'0' && suffix.len() != 1) {
+            return None;
+        }
+        let mut value = 0u32;
+        for &byte in suffix {
+            let digit = byte.wrapping_sub(b'0');
+            if digit > 9 {
+                return None;
+            }
+            value = value * 10 + u32::from(digit);
+        }
+        Some(value as usize)
+    }
+
+    fn insert(&mut self, id: Vec<u8>, value: u32) {
+        if let Some(code) = Self::code(&id) {
+            if self.dense.len() <= code {
+                self.dense.resize(code + 1, 0);
+            }
+            self.dense[code] = value;
+        } else {
+            self.sparse.insert(id, value);
+        }
+    }
+
+    #[inline]
+    fn get(&self, id: &[u8]) -> Option<&u32> {
+        if let Some(code) = Self::code(id) {
+            self.dense.get(code).filter(|&&value| value != 0)
+        } else {
+            self.sparse.get(id)
+        }
+    }
+}
+
 struct Dimensions {
-    products: FastMap<Vec<u8>, u32>,
+    products: DimensionIds<0x7000>,
     categories: Vec<Vec<u8>>,
     unknown: u32,
-    campaigns: FastMap<Vec<u8>, u32>,
+    campaigns: DimensionIds<0x635f>,
     campaign_ids: Vec<Vec<u8>>,
     channels: Vec<Vec<u8>>,
 }
@@ -92,14 +159,14 @@ impl Dimensions {
                 .unwrap() as u32
         };
         let unknown = category_id(b"unknown");
-        let products = entries
-            .into_iter()
-            .map(|(product, category)| (product, category_id(&category)))
-            .collect();
+        let mut products = DimensionIds::new();
+        for (product, category) in entries {
+            products.insert(product, category_id(&category));
+        }
         let campaign_file = fs::read(path.join("campaigns.csv"))?;
         let mut campaign_ids = vec![b"organic".to_vec()];
         let mut channels = vec![b"organic".to_vec()];
-        let mut campaigns = FastMap::default();
+        let mut campaigns = DimensionIds::new();
         csv::rows::<2>(csv::after_header(&campaign_file), |[campaign, channel]| {
             campaigns.insert(campaign.to_vec(), campaign_ids.len() as u32);
             campaign_ids.push(campaign.to_vec());
@@ -741,6 +808,24 @@ fn solve<T: Copy + Send + Ord + Into<i64> + TryFrom<i64>>(
         },
     );
     timer.lap("Group canonical owners, form sessions and attribute");
+    write_results(
+        by_worker,
+        &|key, out| data.names.append(key, out),
+        &data.dimensions,
+        threads,
+        output,
+        timer,
+    )
+}
+
+fn write_results(
+    by_worker: Vec<(Vec<UserDay>, FastMap<(u32, i32), CampaignDay>)>,
+    append_name: &(impl Fn(u64, &mut Vec<u8>) + Sync),
+    dimensions: &Dimensions,
+    threads: usize,
+    output: &Path,
+    timer: &mut Timer,
+) -> io::Result<()> {
     let mut campaign = FastMap::<(u32, i32), CampaignDay>::default();
     let mut user_parts = Vec::new();
     for (users, campaigns) in by_worker {
@@ -778,16 +863,16 @@ fn solve<T: Copy + Send + Ord + Into<i64> + TryFrom<i64>>(
                 output::write_campaigns(
                     output,
                     &campaign,
-                    &data.dimensions.campaign_ids,
-                    &data.dimensions.channels,
+                    &dimensions.campaign_ids,
+                    &dimensions.channels,
                 )
             } else {
                 output::write_users(
                     output,
                     part,
                     &user_parts[part],
-                    |key, buffer| data.names.append(key, buffer),
-                    &data.dimensions.categories,
+                    append_name,
+                    &dimensions.categories,
                 )
             };
         },
@@ -839,10 +924,57 @@ fn run() -> Result<(), Box<dyn Error>> {
     let names = Names::default();
     let dimensions = Dimensions::load(&data)?;
     timer.lap("Map shards and load dimensions");
-    let dedup = std::env::var("J2_DEDUP").unwrap_or_else(|_| "direct".into());
-    let direct_slots = dedup == "direct";
+    let dedup = std::env::var("J2_DEDUP").unwrap_or_else(|_| "rank".into());
+    let direct_slots = dedup == "direct" || dedup == "rank";
     let all_exact = direct_slots || dedup == "exact";
     let linked = OnceLock::new();
+    if dedup == "rank" && u32::try_from(end - (start - WEEK)).is_ok() {
+        let link_files = csv::map_dir(&data.join("links"))?;
+        let event_sample = events.iter().max_by_key(|file| file.len());
+        let link_sample = link_files.iter().max_by_key(|file| file.len());
+        if let (Some(event_sample), Some(link_sample)) = (event_sample, link_sample) {
+            let (layout, user_layout) = thread::scope(|scope| {
+                let user =
+                    scope.spawn(|| user_rank::infer(csv::after_header(link_sample), event_bytes));
+                let layout = rank::infer(csv::after_header(event_sample), event_bytes);
+                (layout, user.join().unwrap())
+            });
+            timer.lap("Infer dense ID layouts");
+            if let (Some(layout), Some(user_layout)) = (
+                layout.filter(|layout| layout.slots <= ranked::MAX_ATLAS_SLOTS),
+                user_layout,
+            ) {
+                let dataset = Dataset {
+                    dimensions,
+                    aliases: &linked,
+                    names: &names,
+                    ids: Names::default(),
+                    click_ids: Names::default(),
+                    start,
+                    end,
+                    late_route: false,
+                    direct_slots: true,
+                    overflow: Mutex::new(Vec::new()),
+                };
+                ranked::solve(
+                    dataset,
+                    layout,
+                    user_layout,
+                    &link_files,
+                    &event_chunks,
+                    &click_chunks,
+                    workers,
+                    &output,
+                    &mut timer,
+                )?;
+                eprintln!(
+                    "Total Rust executable: {:.6}s",
+                    started.elapsed().as_secs_f64()
+                );
+                return Ok(());
+            }
+        }
+    }
     thread::scope(|scope| -> io::Result<()> {
         let build_links = || -> io::Result<()> {
             let values = aliases(&data, &names)?;

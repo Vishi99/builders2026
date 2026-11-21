@@ -181,7 +181,7 @@ fn upper_number(bytes: &[u8]) -> Option<u64> {
 }
 
 #[inline]
-fn signature_projection(number: u64) -> u64 {
+pub(crate) fn signature_projection(number: u64) -> u64 {
     let value = number.wrapping_mul(0xa0_9058_81e9) & ((1u64 << 40) - 1);
     value ^ (value >> 17) ^ (value >> 34)
 }
@@ -204,7 +204,7 @@ pub fn event_signature(bytes: &[u8]) -> u64 {
 }
 
 #[inline]
-fn compact_number(bytes: &[u8]) -> Option<u64> {
+pub(crate) fn compact_number(bytes: &[u8]) -> Option<u64> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     if bytes.len() == 8 {
         return unsafe { numeric_eight(bytes) };

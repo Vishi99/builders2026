@@ -394,35 +394,59 @@ fn footer(schema: &[Field], groups: &[Group]) -> Vec<u8> {
     bytes
 }
 
+pub struct UserWriter(Part);
+
+impl UserWriter {
+    pub fn open(output: &Path, part: usize) -> io::Result<Self> {
+        Part::open(output, "user_daily", part, USERS).map(Self)
+    }
+
+    pub fn append(
+        &mut self,
+        mut rows: &[UserDay],
+        append_user: &impl Fn(u64, &mut Vec<u8>),
+        categories: &[Vec<u8>],
+    ) -> io::Result<()> {
+        let file = &mut self.0;
+        while !rows.is_empty() {
+            let (count, names) =
+                file.user_names(&rows[..rows.len().min(GROUP_ROWS)], &append_user)?;
+            let group = &rows[..count];
+            let columns = vec![
+                names,
+                file.integers(count, group.iter().map(|row| row.day.to_le_bytes()))?,
+                file.integers(count, group.iter().map(|row| row.sessions.to_le_bytes()))?,
+                file.integers(count, group.iter().map(|row| row.events.to_le_bytes()))?,
+                file.integers(count, group.iter().map(|row| row.revenue.to_le_bytes()))?,
+                file.text(
+                    count,
+                    group.iter().map(|row| {
+                        (row.category != 0).then(|| categories[row.category as usize].as_slice())
+                    }),
+                    true,
+                )?,
+            ];
+            file.group(count, columns);
+            rows = &rows[count..];
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> io::Result<()> {
+        self.0.finish()
+    }
+}
+
 pub fn write_users(
     output: &Path,
     part: usize,
-    mut rows: &[UserDay],
+    rows: &[UserDay],
     append_user: impl Fn(u64, &mut Vec<u8>),
     categories: &[Vec<u8>],
 ) -> io::Result<()> {
-    let mut file = Part::open(output, "user_daily", part, USERS)?;
-    while !rows.is_empty() {
-        let (count, names) = file.user_names(&rows[..rows.len().min(GROUP_ROWS)], &append_user)?;
-        let group = &rows[..count];
-        let columns = vec![
-            names,
-            file.integers(count, group.iter().map(|row| row.day.to_le_bytes()))?,
-            file.integers(count, group.iter().map(|row| row.sessions.to_le_bytes()))?,
-            file.integers(count, group.iter().map(|row| row.events.to_le_bytes()))?,
-            file.integers(count, group.iter().map(|row| row.revenue.to_le_bytes()))?,
-            file.text(
-                count,
-                group.iter().map(|row| {
-                    (row.category != 0).then(|| categories[row.category as usize].as_slice())
-                }),
-                true,
-            )?,
-        ];
-        file.group(count, columns);
-        rows = &rows[count..];
-    }
-    file.finish()
+    let mut writer = UserWriter::open(output, part)?;
+    writer.append(rows, &append_user, categories)?;
+    writer.finish()
 }
 
 pub fn write_campaigns(
