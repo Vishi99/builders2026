@@ -103,7 +103,7 @@ void scan_shards(const fs::path& folder, unsigned threads, OnRow&& on_row, Prepa
     struct Chunk {
         size_t file, begin, end;
     };
-    std::vector<input::BufferedFile> files;
+    std::vector<input::MappedFile> files;
     std::vector<Chunk> chunks;
     if (!fs::exists(folder)) {
         return;
@@ -122,10 +122,9 @@ void scan_shards(const fs::path& folder, unsigned threads, OnRow&& on_row, Prepa
     if constexpr (!std::is_same_v<Prepare, std::nullptr_t>) {
         prepare(files);
     }
-    std::vector<input::ChunkBuffer> buffers(std::min<size_t>(threads, chunks.size()));
     parallel_for(chunks.size(), threads, [&](size_t index, unsigned worker) {
         const auto [file, begin, end] = chunks[index];
-        input::for_each_row<Width>(files[file], buffers[worker], begin, end, [&](const auto& row) {
+        input::for_each_row_bytes<Width>(files[file].data(), files[file].size(), begin, end, [&](const auto& row) {
             on_row(row, worker);
         });
     });
