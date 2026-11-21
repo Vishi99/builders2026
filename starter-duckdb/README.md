@@ -43,7 +43,8 @@ make build NATIVE_AMD64_ARCH=x86-64-v4 IMAGE=shopping-avx512
 
 The scorer builds from the submitted revision and uses that revision's Dockerfile default.
 
-The default AVX-512 event scanner reuses delimiter masks across rows.
+The rolling AVX-512 option reuses delimiter masks across rows. The default
+uses the per-row AVX-512 scanner.
 To compare the two scanners on the same Xeon, build from the same source with:
 
 ```sh

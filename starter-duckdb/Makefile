@@ -4,7 +4,7 @@ MEM   ?= 24g
 # The scorer's platform. PLATFORM=linux/arm64 builds and runs natively on an Apple-silicon Mac, for fast local loops.
 PLATFORM ?= linux/amd64
 NATIVE_AMD64_ARCH ?= x86-64-v4
-NATIVE_ROLLING_AVX512 ?= 1
+NATIVE_ROLLING_AVX512 ?= 0
 DEV   ?= dev
 # In the monorepo the fixtures live two levels up; the published starter has its own copy.
 FIXTURES ?= $(if $(wildcard fixtures),fixtures,../../fixtures)

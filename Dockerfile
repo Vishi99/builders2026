@@ -4,8 +4,8 @@
 FROM gcc:14-bookworm AS native-build
 ARG TARGETARCH
 ARG NATIVE_AMD64_ARCH=x86-64-v4
-# Reuse delimiter masks across rows. Set to 0 for the per-row AVX-512 control.
-ARG NATIVE_ROLLING_AVX512=1
+# Set to 1 to reuse delimiter masks across event rows in the AVX-512 scanner.
+ARG NATIVE_ROLLING_AVX512=0
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends liblz4-dev nlohmann-json3-dev \
     && rm -rf /var/lib/apt/lists/*
