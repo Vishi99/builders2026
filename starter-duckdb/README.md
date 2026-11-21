@@ -1,13 +1,13 @@
 # Shopping Sessions pipeline
 
-The scorer image resolves linked IDs, scans CSV shards in parallel, and builds sessions and campaign attribution in C++. PyArrow writes the two daily Parquet tables. The original DuckDB implementation is available for comparison.
+The scorer image runs a standalone C++ executable. It resolves linked IDs, scans CSV shards in parallel, builds sessions and campaign attribution, and writes the two daily Parquet tables. The original DuckDB implementation and the PyArrow writer are available for comparison.
 
 If this starter and `rules.md` ever disagree, `rules.md` wins. Ask the organizers if `rules.md` leaves you unsure.
 
 ## What to do first
 
 - Read `rules.md` for the full rules.
-- Start with `pipeline/native_runner.py` for the scorer entry point and `pipeline/native_pipeline.cpp` for the processing stages.
+- Start with `pipeline/native_main.cpp` for the scorer entrypoint and `pipeline/native_pipeline.cpp` for the processing stages.
 - Build the image and test against all 36 edge-case fixtures and the 1M-event dev set before submitting.
 
 ## Run and test locally
@@ -43,6 +43,9 @@ make build NATIVE_AMD64_ARCH=x86-64-v4 IMAGE=shopping-avx512
 
 The scorer builds from the submitted revision and uses that revision's Dockerfile default.
 
+For a separate AVX-512 scanner experiment, build with `NATIVE_ROLLING_AVX512=1`.
+This reuses delimiter masks across event rows.
+
 To iterate without Docker on Linux with a C++20 compiler:
 
 ```sh
@@ -76,8 +79,8 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 ## Common pitfalls
 
 - **CSV parsing.** The native scanner splits at physical LF boundaries and checks the field count and quote placement. It retains CR, NUL and spaces as field bytes.
-- **Memory.** The native pipeline maps the input CSV shards and keeps compact event and click records in memory. It releases each event partition after deduplication or sessionization.
-- **No extension downloads.** The container has no network at run time. The image builds the C++ library and installs PyArrow ahead of time.
+- **Memory.** Native workers read input shards into reusable buffers and keep compact event and click records in memory. The pipeline releases each event partition after deduplication or sessionization.
+- **Build dependencies.** The image builds the executable with LZ4 and nlohmann JSON. The executable needs no network at run time.
 - **`\d` is not `[0-9]`.** In several regex engines, including Rust's used by Polars, `\d` matches any Unicode digit. The rules mean ASCII digits only.
 - **Extra files in output folders.** `_SUCCESS` and other non-Parquet files in the output folders are ignored.
 

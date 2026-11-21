@@ -349,11 +349,18 @@ struct BlockMasks {
 };
 
 inline BlockMasks classify_block(const char* base) noexcept {
+#if defined(__AVX512BW__)
+    const auto bytes = _mm512_loadu_si512(base);
+    return {_mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8('\n')),
+            _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8(',')),
+            _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8('"'))};
+#else
     const auto low = classify(base);
     const auto high = classify(base + 32);
     return {(std::uint64_t{high.newline} << 32) | low.newline,
             (std::uint64_t{high.comma} << 32) | low.comma,
             (std::uint64_t{high.quote} << 32) | low.quote};
+#endif
 }
 
 inline std::pair<std::uint64_t, std::uint64_t> row_bits(
@@ -424,13 +431,6 @@ const char* scan_rolling_events(const char* line, const char* limit, const char*
 }
 
 #if defined(__AVX512BW__)
-inline BlockMasks classify_event_block64(const char* line) noexcept {
-    const auto bytes = _mm512_loadu_si512(line);
-    return {_mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8('\n')),
-            _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8(',')),
-            _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8('"'))};
-}
-
 // Row ownership follows the first byte. The load guard uses the mapping end
 // because a range may own a row that continues after its scheduling boundary.
 template <typename Callback>
@@ -438,14 +438,14 @@ const char* scan_avx512_events(const char* line, const char* limit, const char* 
                               std::array<std::string_view, 7>& fields, Callback& callback) {
     constexpr unsigned block_bytes = 64;
     while (line < limit && last - line >= block_bytes) {
-        const auto first = classify_event_block64(line);
+        const auto first = classify_block(line);
         BlockMasks second{};
         unsigned length = std::countr_zero(first.newline);
         if (first.newline == 0) {
             if (last - line < 2 * block_bytes) {
                 break;
             }
-            second = classify_event_block64(line + block_bytes);
+            second = classify_block(line + block_bytes);
             length = block_bytes + std::countr_zero(second.newline);
         }
         if (length == 2 * block_bytes) {
@@ -564,7 +564,7 @@ void for_each_row_bytes(const char* data, std::size_t size, std::size_t begin,
     std::array<std::string_view, Width> fields;
 #if defined(__AVX2__) && defined(__BMI2__)
     if constexpr (Width == 7) {
-#if defined(__AVX512BW__)
+#if defined(__AVX512BW__) && !defined(SHOPPING_ROLLING_AVX512)
         line = detail::scan_avx512_events(line, limit, last, fields, callback);
 #else
         line = detail::scan_rolling_events(line, limit, last, fields, callback);
