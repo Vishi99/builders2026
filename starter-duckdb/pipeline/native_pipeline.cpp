@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <future>
 #include <memory>
+#include <optional>
 
 extern "C" shopping::Output* shopping_run(const char* data_dir, const char* window_start,
                                           const char* window_end,
@@ -54,20 +55,31 @@ extern "C" shopping::Output* shopping_run(const char* data_dir, const char* wind
         }
         const Identities identities = linked.get();
         timer.report("Finish linked ID resolution");
+        const bool clicks_prepared = !raw_clicks.empty();
+        std::optional<attribution::CampaignAccumulator> accumulated;
+        if (clicks_prepared) {
+            accumulated.emplace(start, end, campaigns.ids.size(), threads);
+        }
         EventTotals events;
         if (packed) {
-            events = packed_events::make_sessions(*packed, identities, start,
-                                                  products.categories.size(), threads, timer, raw_clicks);
-            timer.report("Merge bins and build user sessions");
+            events = packed_events::make_sessions(
+                *packed, identities, start, products.categories.size(), threads, timer, raw_clicks,
+                [&](size_t bucket, unsigned worker, std::vector<Session>& sessions) {
+                    if (accumulated) {
+                        attribution::attribute_owner(sessions, raw_clicks, bucket,
+                            accumulated->worker(worker), click_keys, click_time_base);
+                        std::vector<Session>().swap(sessions);
+                    }
+                });
+            timer.report(clicks_prepared ? "Build and attribute sessions by owner"
+                                        : "Merge bins and build user sessions");
         } else {
             events = process_events(data, start, end, identities, products, threads, timer);
         }
-        const bool clicks_prepared = !raw_clicks.empty();
-        const auto credited = clicks_prepared
-            ? attribute_partitioned(start, end, events.sessions, std::move(raw_clicks), click_keys,
-                                    campaigns.ids.size(), threads, click_time_base)
+        const auto credited = accumulated
+            ? accumulated->finish()
             : attribute(data, start, end, events.sessions, identities, click_keys, campaigns.ids, threads);
-        timer.report(clicks_prepared ? "Attribute sessions" : "Parse clicks and attribute sessions");
+        timer.report(clicks_prepared ? "Merge campaign totals" : "Parse clicks and attribute sessions");
         result->users.fill(events.days, user_keys, products, threads);
         result->campaigns.fill(credited, campaigns);
         timer.report("Assemble output columns");

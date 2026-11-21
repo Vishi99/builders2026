@@ -175,6 +175,37 @@ inline ByteMasks classify(const char* position) noexcept {
 template <std::size_t Width>
 inline constexpr std::ptrdiff_t short_scan_bytes = Width == 7 ? 96 : 64;
 
+template <std::size_t Width>
+inline bool decode_masked_fields(const char* line, const char* last, std::uint64_t commas,
+                                 std::uint64_t late_commas, unsigned quote_count,
+                                 std::array<std::string_view, Width>& fields) noexcept {
+    if (std::popcount(commas) + std::popcount(late_commas) != Width - 1) {
+        return false;
+    }
+    unsigned wrapped_fields = 0;
+    const char* start = line;
+    auto field = [&](std::size_t column, const char* end) {
+        const auto size = end - start;
+        const bool wrapped = (size >= 2) & (*start == '"') & (end[-1] == '"');
+        wrapped_fields += wrapped;
+        fields[column] = std::string_view(start + wrapped, size - 2 * wrapped);
+        start = end + 1;
+    };
+    for (std::size_t column = 0; column < Width - 1; ++column) {
+        unsigned boundary;
+        if (commas != 0) {
+            boundary = std::countr_zero(commas);
+            commas &= commas - 1;
+        } else {
+            boundary = 64 + std::countr_zero(late_commas);
+            late_commas &= late_commas - 1;
+        }
+        field(column, line + boundary);
+    }
+    field(Width - 1, last);
+    return quote_count == 2 * wrapped_fields;
+}
+
 // The caller guarantees that the vector loads stay within the map. A missing
 // LF delegates the whole row to the generic decoder.
 template <std::size_t Width>
@@ -199,36 +230,147 @@ inline const char* decode_short_row(const char* line, std::array<std::string_vie
     const unsigned tail = length > 64 ? length - 64 : 0;
     auto commas = _bzhi_u64((std::uint64_t{second.comma} << 32) | first.comma, length);
     auto late_commas = _bzhi_u32(third.comma, tail);
-    if (std::popcount(commas) + std::popcount(late_commas) != Width - 1) {
-        return last;
-    }
     const auto quotes = _bzhi_u64((std::uint64_t{second.quote} << 32) | first.quote, length);
     const auto late_quotes = _bzhi_u32(third.quote, tail);
     const unsigned quote_count = std::popcount(quotes) + std::popcount(late_quotes);
-    unsigned wrapped_fields = 0;
-    const char* start = line;
-    auto field = [&](std::size_t column, const char* end) {
-        const auto size = end - start;
-        const bool wrapped = (size >= 2) & (*start == '"') & (end[-1] == '"');
-        wrapped_fields += wrapped;
-        fields[column] = std::string_view(start + wrapped, size - 2 * wrapped);
-        start = end + 1;
-    };
-    for (std::size_t column = 0; column < Width - 1; ++column) {
-        unsigned boundary;
-        if (commas != 0) {
-            boundary = std::countr_zero(commas);
-            commas &= commas - 1;
-        } else {
-            boundary = 64 + std::countr_zero(late_commas);
-            late_commas &= late_commas - 1;
-        }
-        field(column, line + boundary);
-    }
-    field(Width - 1, last);
-    valid = quote_count == 2 * wrapped_fields;
+    valid = decode_masked_fields(line, last, commas, late_commas, quote_count, fields);
     return last;
 }
+
+struct BlockMasks {
+    std::uint64_t newline, comma, quote;
+};
+
+inline BlockMasks classify_block(const char* base) noexcept {
+    const auto low = classify(base);
+    const auto high = classify(base + 32);
+    return {(std::uint64_t{high.newline} << 32) | low.newline,
+            (std::uint64_t{high.comma} << 32) | low.comma,
+            (std::uint64_t{high.quote} << 32) | low.quote};
+}
+
+inline std::pair<std::uint64_t, std::uint64_t> row_bits(
+    std::uint64_t first, std::uint64_t next, std::uint64_t third,
+    unsigned skip, unsigned length) noexcept {
+    if (skip != 0) {
+        const unsigned carry = 64 - skip;
+        first = (first >> skip) | (next << carry);
+        next = (next >> skip) | (third << carry);
+    }
+    return {_bzhi_u64(first, length), _bzhi_u64(next, length > 64 ? length - 64 : 0)};
+}
+
+// The row start belongs to this byte range. Loads may cross range boundaries
+// while the backing file contains the complete lookahead block.
+template <typename Callback>
+const char* scan_rolling_events(const char* line, const char* limit, const char* last,
+                               std::array<std::string_view, 7>& fields, Callback& callback) {
+    constexpr unsigned block_bytes = 64;
+    constexpr unsigned lookahead_bytes = 3 * block_bytes;
+    if (line >= limit || last - line < lookahead_bytes) {
+        return line;
+    }
+    const char* base = line;
+    auto first = classify_block(base);
+    auto second = classify_block(base + block_bytes);
+    auto third = classify_block(base + 2 * block_bytes);
+    while (true) {
+        const unsigned skip = static_cast<unsigned>(line - base);
+        const auto first_lfs = first.newline & (~std::uint64_t{0} << skip);
+        const unsigned end_offset = first_lfs != 0 ? std::countr_zero(first_lfs)
+            : second.newline != 0 ? block_bytes + std::countr_zero(second.newline)
+            : 2 * block_bytes + std::countr_zero(third.newline);
+        const unsigned length = end_offset - skip;
+        if (length > 2 * block_bytes) {
+            return line;
+        }
+
+        const char* const end = base + end_offset;
+        const auto [commas, late_commas] = row_bits(first.comma, second.comma, third.comma, skip, length);
+        const auto [quotes, late_quotes] = row_bits(first.quote, second.quote, third.quote, skip, length);
+        if (decode_masked_fields(line, end, commas, late_commas,
+                                 std::popcount(quotes) + std::popcount(late_quotes), fields)) {
+            callback(std::as_const(fields));
+        }
+
+        line = end + 1;
+        if (line >= limit) {
+            return line;
+        }
+        const unsigned advance = (end_offset + 1) / block_bytes;
+        if (advance == 0) {
+            continue;
+        }
+        base += advance * block_bytes;
+        if (last - base < lookahead_bytes) {
+            return line;
+        }
+        if (advance == 1) {
+            first = second;
+            second = third;
+        } else {
+            first = advance == 2 ? third : classify_block(base);
+            second = classify_block(base + block_bytes);
+        }
+        third = classify_block(base + 2 * block_bytes);
+    }
+}
+
+#if defined(__AVX512BW__)
+inline BlockMasks classify_event_block64(const char* line) noexcept {
+    const auto bytes = _mm512_loadu_si512(line);
+    return {_mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8('\n')),
+            _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8(',')),
+            _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8('"'))};
+}
+
+// Row ownership follows the first byte. The load guard uses the mapping end
+// because a range may own a row that continues after its scheduling boundary.
+template <typename Callback>
+const char* scan_avx512_events(const char* line, const char* limit, const char* last,
+                              std::array<std::string_view, 7>& fields, Callback& callback) {
+    constexpr unsigned block_bytes = 64;
+    while (line < limit && last - line >= block_bytes) {
+        const auto first = classify_event_block64(line);
+        BlockMasks second{};
+        unsigned length = std::countr_zero(first.newline);
+        if (first.newline == 0) {
+            if (last - line < 2 * block_bytes) {
+                break;
+            }
+            second = classify_event_block64(line + block_bytes);
+            length = block_bytes + std::countr_zero(second.newline);
+        }
+        if (length == 2 * block_bytes) {
+            // The complete vector prefix had no LF. Finish this row with
+            // the general decoder, then resume the short-row path.
+            const char* newline = find_byte(line + length, last, '\n');
+            const char* end = newline == nullptr ? last : newline;
+            const bool valid = last - end >= 31 ? decode_padded_row(line, end, fields)
+                                                  : decode_row(line, end, fields);
+            if (valid) {
+                callback(std::as_const(fields));
+            }
+            line = newline == nullptr ? last : newline + 1;
+            continue;
+        }
+
+        const char* const end = line + length;
+        const unsigned tail = length > block_bytes ? length - block_bytes : 0;
+        const auto commas = _bzhi_u64(first.comma, length);
+        const auto late_commas = _bzhi_u64(second.comma, tail);
+        const auto quotes = _bzhi_u64(first.quote, length);
+        const auto late_quotes = _bzhi_u64(second.quote, tail);
+        if (decode_masked_fields(line, end, commas, late_commas,
+                                 std::popcount(quotes) + std::popcount(late_quotes), fields)) {
+            callback(std::as_const(fields));
+        }
+        line = end + 1;
+    }
+    return line;
+}
+#endif
+
 #endif
 
 template <typename Integer>
@@ -241,6 +383,27 @@ inline Integer unsigned_decimal(std::string_view value, Integer invalid) noexcep
     const auto parsed = std::from_chars(value.data(), end, result);
     return parsed.ec == std::errc{} && parsed.ptr == end ? result : invalid;
 }
+
+#if defined(__AVX2__) && defined(__BMI2__)
+// Two bounded loads cover exactly 13 bytes. Pad the last five digits with
+// three ASCII zeroes so both eight-byte lanes can share the decimal reduction.
+inline std::int64_t milliseconds_13(const char* text, std::int64_t invalid) noexcept {
+    const auto raw = _mm_unpacklo_epi64(_mm_loadu_si64(text), _mm_loadu_si64(text + 5));
+    const auto padded = _mm_or_si128(
+        _mm_and_si128(raw, _mm_set_epi64x(-0x1000000LL, -1LL)),
+        _mm_set_epi64x(0x303030, 0));
+    const auto digits = _mm_sub_epi8(padded, _mm_set1_epi8('0'));
+    const auto outside = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+    if (!_mm_testz_si128(outside, outside)) {
+        return invalid;
+    }
+    const auto pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+    const auto groups = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
+    const auto words = _mm_packus_epi32(groups, groups);
+    const auto values = _mm_madd_epi16(words, _mm_set1_epi32(0x00012710));
+    return std::int64_t{_mm_cvtsi128_si32(values)} * 100'000 + _mm_extract_epi32(values, 1);
+}
+#endif
 
 inline int decimal_pair(const char* value) noexcept {
     const unsigned first = static_cast<unsigned char>(value[0]) - '0';
@@ -292,6 +455,15 @@ void for_each_row(const MappedFile& file, std::size_t begin, std::size_t end, Ca
     }
 
     std::array<std::string_view, Width> fields;
+#if defined(__AVX2__) && defined(__BMI2__)
+    if constexpr (Width == 7) {
+#if defined(__AVX512BW__)
+        line = detail::scan_avx512_events(line, limit, last, fields, callback);
+#else
+        line = detail::scan_rolling_events(line, limit, last, fields, callback);
+#endif
+    }
+#endif
     while (line < limit) {
 #if defined(__AVX2__) && defined(__BMI2__)
         if constexpr (Width == 4 || Width == 7) {
@@ -336,6 +508,11 @@ inline std::int64_t timestamp_ms(std::string_view value) noexcept {
     const bool utc = value.size() == 20 && value[19] == 'Z';
     const bool offset = value.size() == 25 && (value[19] == '+' || value[19] == '-');
     if (!utc && !offset) {
+#if defined(__AVX2__) && defined(__BMI2__)
+        if (value.size() == 13) {
+            return detail::milliseconds_13(value.data(), invalid_timestamp);
+        }
+#endif
         // Parsing an unsigned integer rejects a leading sign and accepts zero padding.
         constexpr auto maximum = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
         const auto parsed = detail::unsigned_decimal(value, maximum + 1);

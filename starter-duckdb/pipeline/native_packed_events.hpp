@@ -112,11 +112,52 @@ inline void deduplicate(Input& input, unsigned threads) {
             return;
         }
 
+        struct SignatureWord {
+            uint64_t seen = 0;
+            uint64_t ambiguous = 0;
+        };
+        std::vector<SignatureWord> signatures;
+        size_t signature_mask = 0;
+        size_t candidates = count;
+        if (count >= 1024) {
+            // The same exact key always goes to the same bit. A bit set by
+            // just one ticket certifies that key as a singleton.
+            const size_t domain = std::bit_ceil(std::min(count, size_t{1} << 20) * 8);
+            signature_mask = domain - 1;
+            signatures.resize(domain / 64);
+            candidates = 0;
+            for (const auto& source : input.tickets) {
+                for (const auto& copy : source[bucket]) {
+                    const size_t signature = copy.key() & signature_mask;
+                    const uint64_t bit = uint64_t{1} << (signature % 64);
+                    auto& word = signatures[signature / 64];
+                    const uint64_t repeated = word.seen & bit;
+                    // The second hit counts both tickets. Each further hit
+                    // adds only its own ticket to the exact table size.
+                    candidates += (repeated != 0) + ((repeated & ~word.ambiguous) != 0);
+                    word.seen |= bit;
+                    word.ambiguous |= repeated;
+                }
+                if (candidates > count / 3) {
+                    std::vector<SignatureWord>().swap(signatures);
+                    candidates = count;
+                    break;
+                }
+            }
+        }
+
         constexpr uintptr_t producer_bits = alignof(Ticket) - 1;
         auto ticket_of = [](uintptr_t link) { return reinterpret_cast<Ticket*>(link & ~producer_bits); };
-        EventWinnerSlots winners(count);
+        EventWinnerSlots winners(candidates);
         for (size_t worker = 0; worker < input.tickets.size(); ++worker) {
             for (auto& copy : input.tickets[worker][bucket]) {
+                if (!signatures.empty()) {
+                    const size_t signature = copy.key() & signature_mask;
+                    const uint64_t bit = uint64_t{1} << (signature % 64);
+                    if ((signatures[signature / 64].ambiguous & bit) == 0) {
+                        continue;
+                    }
+                }
                 auto& link = winners.find(copy.hash(bucket), [&](uintptr_t candidate) {
                     return ticket_of(candidate)->key() == copy.key();
                 });
@@ -137,9 +178,10 @@ inline void deduplicate(Input& input, unsigned threads) {
     });
 }
 
-inline EventTotals make_sessions(Input& input, const Identities& identities, int64_t start,
-                                 size_t category_count, unsigned threads, StageTimer& timer,
-                                 Partitioned<CompactClick>& raw_clicks) {
+template<class OnSessions>
+EventTotals make_sessions(Input& input, const Identities& identities, int64_t start,
+                          size_t category_count, unsigned threads, StageTimer& timer,
+                          Partitioned<CompactClick>& raw_clicks, OnSessions&& on_sessions) {
     Partitioned<Event> forwarded(threads);
     Partitioned<CompactClick> forwarded_clicks(raw_clicks.empty() ? 0 : threads);
     std::array<std::unique_ptr<session_bins::Bins>, partition_count> resident;
@@ -195,7 +237,7 @@ inline EventTotals make_sessions(Input& input, const Identities& identities, int
     timer.report("Resolve raw ID partitions and group events and clicks");
 
     EventTotals totals;
-    parallel_for(partition_count, threads, [&](size_t bucket, unsigned) {
+    parallel_for(partition_count, threads, [&](size_t bucket, unsigned worker) {
         auto& bins = resident[bucket];
         for (auto& source : forwarded) {
             auto& rows = source[bucket];
@@ -212,6 +254,7 @@ inline EventTotals make_sessions(Input& input, const Identities& identities, int
                                    totals.sessions[bucket], totals.days[bucket]);
             bins.reset();
         }
+        on_sessions(bucket, worker, totals.sessions[bucket]);
     });
     return totals;
 }
