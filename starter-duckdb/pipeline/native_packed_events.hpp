@@ -2,6 +2,9 @@
 
 #include "native_attribution.hpp"
 
+#include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <iterator>
 #include <optional>
 
@@ -47,28 +50,106 @@ struct Input {
     Partitioned<Event> payloads;
 };
 
+struct Ingest {
+    int64_t day_start;
+    int64_t seconds;
+
+    bool late(int64_t event) const {
+        // Ingest on the event's UTC day or earlier always passes. Only
+        // events on the previous UTC day need an exact clock comparison.
+        return event < day_start &&
+               (event < day_start - day_ms || event < (seconds - 86'400) * 1000);
+    }
+};
+
+class IngestDates {
+    struct Day {
+        std::array<char, 11> ascii{};
+        int64_t midnight_ms{};
+        int64_t midnight_seconds{};
+    };
+    std::array<Day, 32> dates_{};
+
+    static unsigned slot(std::string_view value) {
+        return (static_cast<unsigned char>(value[8]) * 10u +
+                static_cast<unsigned char>(value[9])) & 31u;
+    }
+
+public:
+    IngestDates(int64_t start, int64_t end) {
+        using namespace std::chrono;
+        const auto day_index = [](int64_t ms) { return ms / day_ms - (ms % day_ms < 0); };
+        constexpr auto first_civil_day = sys_days{year{0} / 1 / 1}.time_since_epoch().count();
+        constexpr auto last_civil_day = sys_days{year{9999} / 12 / 31}.time_since_epoch().count();
+        const auto first = day_index(start);
+        if (first < first_civil_day || first > last_civil_day) {
+            return;
+        }
+        // Cache dates around the dataset's window. A miss always falls back
+        // to the general parser, including a collision on day-of-month.
+        const auto final = std::min<int64_t>({day_index(end - 1) + 7, first + 29, last_civil_day});
+        for (int64_t day = first; day <= final; ++day) {
+            const auto civil = year_month_day{sys_days{days{static_cast<days::rep>(day)}}};
+            const auto year = static_cast<int>(civil.year());
+            std::array<char, 11> ascii{};
+            std::snprintf(ascii.data(), ascii.size(), "%04d-%02u-%02u", year,
+                          static_cast<unsigned>(civil.month()), static_cast<unsigned>(civil.day()));
+            dates_[slot(std::string_view(ascii.data(), 10))] = {ascii, day * day_ms, day * 86'400};
+        }
+    }
+
+    Ingest parse(std::string_view value) const {
+        if (value.size() == 20 && value[19] == 'Z') {
+            const auto& date = dates_[slot(value)];
+            if (std::memcmp(date.ascii.data(), value.data(), 10) == 0 &&
+                value[10] == 'T' && value[13] == ':' && value[16] == ':') {
+                const int hour = input::detail::decimal_pair(value.data() + 11);
+                const int minute = input::detail::decimal_pair(value.data() + 14);
+                const int second = input::detail::decimal_pair(value.data() + 17);
+                if (static_cast<unsigned>(hour) <= 23 && static_cast<unsigned>(minute) <= 59 &&
+                    static_cast<unsigned>(second) <= 59) {
+                    return {date.midnight_ms, date.midnight_seconds + (hour * 60 + minute) * 60 + second};
+                }
+            }
+        }
+        const int64_t full = input::ingest_ms(value);
+        if (full == input::invalid_timestamp) {
+            throw std::runtime_error("Invalid ingest_ts on a parsed event");
+        }
+        if (full % 1000 != 0) {
+            // The packed ticket only represents whole-second ingest times.
+            return {0, input::invalid_timestamp};
+        }
+        const auto remainder = full % day_ms;
+        return {full - (remainder < 0 ? remainder + day_ms : remainder), full / 1000};
+    }
+};
+
 inline std::optional<Input> scan(const fs::path& data, int64_t start, int64_t end,
                                  const IdKeys& user_keys, const Products& products,
                                  unsigned threads) {
     Input batch{Partitioned<Ticket>(threads), Partitioned<Event>(threads)};
     IdKeys event_keys;
+    const IngestDates dates(start, end);
     std::atomic<bool> need_wide{false};
     scan_shards<7>(data / "events", threads, [&](const auto& row, unsigned worker) {
         if (row[0].empty()) {
             return;
         }
-        const auto ingest = input::ingest_ms(row[3]);
-        if (ingest == input::invalid_timestamp) {
-            throw std::runtime_error("Invalid ingest_ts on a parsed event");
+        const auto ingest = dates.parse(row[3]);
+        if (ingest.seconds == input::invalid_timestamp) {
+            need_wide.store(true, std::memory_order_relaxed);
+            return;
         }
-        const auto ingest_rank = static_cast<uint64_t>(ingest / 1000 + Ticket::ingest_bias);
-        if (ingest_rank >= (uint64_t{1} << 39) || ingest % 1000 != 0) {
+        const auto ingest_rank = static_cast<uint64_t>(ingest.seconds + Ticket::ingest_bias);
+        if (ingest_rank >= (uint64_t{1} << 39)) {
             need_wide.store(true, std::memory_order_relaxed);
             return;
         }
 
         uint32_t handle = 0;
-        const auto event = event_payload<uint32_t>(row, ingest, start, end, start, products,
+        const auto event = event_payload<uint32_t>(
+            row, [&](int64_t time) { return ingest.late(time); }, start, end, start, products,
             [&](std::string_view user) { return user_keys.key(user); });
         if (event.person != 0) {
             const size_t bucket = bucket_for_key(event.person);
