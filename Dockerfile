@@ -1,6 +1,16 @@
-# Shopping Sessions: DuckDB pipeline.
+# Shopping Sessions: native processing and Parquet output.
 # The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
 # no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
+FROM gcc:14-bookworm AS native-build
+ARG TARGETARCH
+WORKDIR /src
+COPY starter-duckdb/pipeline/*.cpp starter-duckdb/pipeline/*.hpp ./
+RUN set -eu; \
+    cpu_flags=; \
+    if [ "$TARGETARCH" = amd64 ]; then cpu_flags=-march=x86-64-v3; fi; \
+    g++ -std=c++20 -O3 -DNDEBUG -flto -fPIC -shared -pthread $cpu_flags \
+        -static-libstdc++ -static-libgcc native_pipeline.cpp -o /shopping_native.so
+
 FROM python:3.12-slim-bookworm
 
 # The scorer runs the container as uid 1000; give that uid a name and a home.
@@ -10,6 +20,7 @@ COPY starter-duckdb/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY starter-duckdb/pipeline/ /app/pipeline/
+COPY --from=native-build /shopping_native.so /app/pipeline/shopping_native.so
 COPY starter-duckdb/run.sh /app/run.sh
 RUN chmod +x /app/run.sh
 

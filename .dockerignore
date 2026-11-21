@@ -7,3 +7,5 @@
 !starter-duckdb/pipeline/
 !starter-duckdb/pipeline/*.py
 !starter-duckdb/pipeline/*.sql
+!starter-duckdb/pipeline/*.cpp
+!starter-duckdb/pipeline/*.hpp

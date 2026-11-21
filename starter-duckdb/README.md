@@ -1,13 +1,13 @@
-# Shopping Sessions: DuckDB starter
+# Shopping Sessions pipeline
 
-The pipeline loads the challenge CSV data, resolves linked IDs, and produces the user and campaign daily Parquet tables. DuckDB scans event and click shards as raw lines and validates their fields in SQL. Python resolves linked IDs and handles shards that require exact byte parsing.
+The scorer image resolves linked IDs, scans CSV shards in parallel, and builds sessions and campaign attribution in C++. PyArrow writes the two daily Parquet tables. The original DuckDB implementation is available for comparison.
 
 If this starter and `rules.md` ever disagree, `rules.md` wins. Ask the organizers if `rules.md` leaves you unsure.
 
 ## What to do first
 
 - Read `rules.md` for the full rules.
-- Start with `pipeline/pipeline.py` for input and output, then read `pipeline/events.sql` and `pipeline/attribution.sql`.
+- Start with `pipeline/native_runner.py` for the scorer entry point and `pipeline/native_pipeline.cpp` for the processing stages.
 - Build the image and test against all 36 edge-case fixtures and the 1M-event dev set before submitting.
 
 ## Run and test locally
@@ -34,14 +34,15 @@ If your laptop cannot spare 8 cores and 24 GB, run with lower limits using `make
 - **x86 Linux and Windows machines.** Build and run the amd64 image natively.
 - **Apple-silicon Macs.** Emulating amd64 is slow. For fast local loops, build a native image with `make build run-dev PLATFORM=linux/arm64`. The Dockerfile pins no platform, so it builds either way. Check the amd64 image before you submit.
 
-To iterate without Docker:
+To iterate without Docker on Linux with a C++20 compiler:
 
 ```sh
 python3 -m pip install -r requirements.txt polars
-scratch=$(mktemp -d)
-SCRATCH_DIR="$scratch" NCPU=4 MEM_GB=8 \
-  python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
+make native
+NCPU=4 python3 scripts/run_fixtures.py fixtures -- python3 pipeline/native_runner.py
 ```
+
+`pipeline/pipeline.py` uses the native library when it has been built in place and runs the DuckDB reference otherwise.
 
 ## Submitting and scoring
 
@@ -65,9 +66,9 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 
 ## Common pitfalls
 
-- **CSV parsing.** The native scanner reads one field per raw line, with quote handling disabled. SQL checks quote placement and field counts. Shards with CR or NUL use the binary Python parser and bounded Arrow batches.
-- **Memory.** `pipeline.py` sets `memory_limit` to 80% of `MEM_GB` and `temp_directory` under `/scratch`, so big joins and sorts spill to disk instead of getting the container killed.
-- **No extension downloads.** The container has no network at run time. Parquet and CSV are built into the wheel; anything else must be installed at build time.
+- **CSV parsing.** The native scanner splits at physical LF boundaries and checks the field count and quote placement. It retains CR, NUL and spaces as field bytes.
+- **Memory.** The native pipeline maps the input CSV shards and keeps compact event and click records in memory. It releases each event partition after deduplication or sessionization.
+- **No extension downloads.** The container has no network at run time. The image builds the C++ library and installs PyArrow ahead of time.
 - **`\d` is not `[0-9]`.** In several regex engines, including Rust's used by Polars, `\d` matches any Unicode digit. The rules mean ASCII digits only.
 - **Extra files in output folders.** `_SUCCESS` and other non-Parquet files in the output folders are ignored.
 
@@ -79,9 +80,10 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 
 ## Files in this starter
 
-- `pipeline/pipeline.py` loads inputs, resolves identities, and writes Parquet.
-- `pipeline/events.sql` cleans events and builds sessions and user totals.
-- `pipeline/attribution.sql` cleans clicks and builds campaign credit and assists.
+- `pipeline/native_input.hpp` parses CSV, timestamps and prices.
+- `pipeline/native_events.hpp` deduplicates events, builds sessions and summarizes user days.
+- `pipeline/native_attribution.hpp` credits sessions and counts assists.
+- `pipeline/pipeline.py`, `pipeline/events.sql` and `pipeline/attribution.sql` contain the DuckDB reference.
 - The [repository Dockerfile](../Dockerfile) builds the `linux/amd64` scorer image.
 - `fixtures/` holds the 36 edge cases, each an `input/` folder and the `expected/` tables. In this monorepo they live in `../../fixtures`; copy them in when publishing the starter as its own repo.
 - `scripts/` runs your image the way the scorer does and diffs the output.

@@ -211,4 +211,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    library = Path(__file__).with_name("shopping_native.so")
+    if library.is_file():
+        from native_runner import main as run_native
+        run_native(library)
+    else:
+        main()

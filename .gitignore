@@ -20,6 +20,7 @@ scratch/
 *.parquet
 *.duckdb
 *.duckdb.wal
+starter-duckdb/pipeline/shopping_native.so
 generator/
 generate
 generator.zip

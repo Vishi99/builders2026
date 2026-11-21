@@ -8,11 +8,17 @@ DEV   ?= dev
 FIXTURES ?= $(if $(wildcard fixtures),fixtures,../../fixtures)
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: build fixtures dev run-dev check-dev
+.PHONY: build native fixtures dev run-dev check-dev
 
 ## Build the image for the scorer's platform, linux/amd64 (emulated on Apple silicon)
 build:
 	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE) ..
+
+## Build the native library for running pipeline.py directly on Linux
+native: pipeline/shopping_native.so
+
+pipeline/shopping_native.so: pipeline/native_pipeline.cpp $(wildcard pipeline/*.hpp)
+	$(CXX) -std=c++20 -O3 -DNDEBUG -march=native -fPIC -shared -pthread $< -o $@
 
 ## Run the image on all 36 edge-case fixtures and diff against the expected tables
 fixtures: build

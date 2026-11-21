@@ -1,0 +1,304 @@
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cerrno>
+#include <charconv>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <string_view>
+#include <system_error>
+#include <utility>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#if defined(__AVX2__) && defined(__BMI2__)
+#include <immintrin.h>
+#endif
+
+namespace input {
+
+class MappedFile {
+public:
+    explicit MappedFile(const char* path) {
+        const int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            throw std::system_error(errno, std::generic_category(), path);
+        }
+        struct stat status {};
+        if (fstat(fd, &status) != 0) {
+            const int error = errno;
+            close(fd);
+            throw std::system_error(error, std::generic_category(), path);
+        }
+        size_ = static_cast<std::size_t>(status.st_size);
+        if (size_ != 0) {
+            void* mapped = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (mapped == MAP_FAILED) {
+                const int error = errno;
+                close(fd);
+                throw std::system_error(error, std::generic_category(), path);
+            }
+            data_ = static_cast<const char*>(mapped);
+        }
+        close(fd);
+    }
+
+    MappedFile(const MappedFile&) = delete;
+    MappedFile& operator=(const MappedFile&) = delete;
+
+    MappedFile(MappedFile&& other) noexcept
+        : data_(std::exchange(other.data_, nullptr)), size_(std::exchange(other.size_, 0)) {}
+
+    MappedFile& operator=(MappedFile&& other) noexcept {
+        std::swap(data_, other.data_);
+        std::swap(size_, other.size_);
+        return *this;
+    }
+
+    ~MappedFile() {
+        if (data_ != nullptr) {
+            munmap(const_cast<char*>(data_), size_);
+        }
+    }
+
+    [[nodiscard]] const char* data() const noexcept { return data_; }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+private:
+    const char* data_ = nullptr;
+    std::size_t size_ = 0;
+};
+
+namespace detail {
+
+inline const char* find_byte(const char* first, const char* last, char byte) noexcept {
+    return static_cast<const char*>(std::memchr(first, byte, last - first));
+}
+
+inline const char* next_line(const char* first, const char* last) noexcept {
+    const char* newline = find_byte(first, last, '\n');
+    return newline == nullptr ? last : newline + 1;
+}
+
+inline bool decode_field(const char* first, const char* last, std::string_view& field) noexcept {
+    if (first != last && *first == '"') {
+        if (last - first < 2 || last[-1] != '"') {
+            return false;
+        }
+        ++first;
+        --last;
+    }
+    if (find_byte(first, last, '"') != nullptr) {
+        return false;
+    }
+    field = std::string_view(first, last - first);
+    return true;
+}
+
+template <std::size_t Width>
+inline bool decode_row(const char* first, const char* last,
+                       std::array<std::string_view, Width>& fields) noexcept {
+    for (std::size_t column = 0; column + 1 < Width; ++column) {
+        const char* comma = find_byte(first, last, ',');
+        if (comma == nullptr || !decode_field(first, comma, fields[column])) {
+            return false;
+        }
+        first = comma + 1;
+    }
+    return find_byte(first, last, ',') == nullptr && decode_field(first, last, fields.back());
+}
+
+#if defined(__AVX2__) && defined(__BMI2__)
+// Use this decoder only when the map still has enough bytes for the last load.
+// Count every quote, then prove each is one of a field's two wrapping quotes.
+template <std::size_t Width>
+inline bool decode_padded_row(const char* first, const char* last,
+                              std::array<std::string_view, Width>& fields) noexcept {
+    const auto comma_bytes = _mm256_set1_epi8(',');
+    const auto quote_bytes = _mm256_set1_epi8('"');
+    std::size_t column = 0;
+    std::size_t quote_count = 0;
+    std::size_t wrapped_fields = 0;
+    auto field = [&](const char* end) {
+        const bool wrapped = first < end && *first == '"';
+        if (wrapped && (end - first < 2 || end[-1] != '"')) {
+            return false;
+        }
+        wrapped_fields += wrapped;
+        fields[column++] = std::string_view(first + wrapped, end - first - 2 * wrapped);
+        first = end + 1;
+        return true;
+    };
+    for (const char* block = first; block < last;) {
+        const auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block));
+        const unsigned size = std::min<std::ptrdiff_t>(last - block, 32);
+        const auto quotes = _bzhi_u32(
+            static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, quote_bytes))), size);
+        auto commas = _bzhi_u32(
+            static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, comma_bytes))), size);
+        quote_count += std::popcount(quotes);
+        while (commas != 0) {
+            if (column + 1 >= Width || !field(block + std::countr_zero(commas))) {
+                return false;
+            }
+            commas &= commas - 1;
+        }
+        block += size;
+    }
+    return column + 1 == Width && field(last) && quote_count == 2 * wrapped_fields;
+}
+#endif
+
+template <typename Integer>
+inline Integer unsigned_decimal(std::string_view value, Integer invalid) noexcept {
+    if (value.empty()) {
+        return invalid;
+    }
+    Integer result;
+    const char* const end = value.data() + value.size();
+    const auto parsed = std::from_chars(value.data(), end, result);
+    return parsed.ec == std::errc{} && parsed.ptr == end ? result : invalid;
+}
+
+inline int decimal_pair(const char* value) noexcept {
+    const unsigned first = static_cast<unsigned char>(value[0]) - '0';
+    const unsigned second = static_cast<unsigned char>(value[1]) - '0';
+    return first <= 9 && second <= 9 ? static_cast<int>(first * 10 + second) : -1;
+}
+
+}  // namespace detail
+
+// Byte ranges can be scanned concurrently. A range owns rows whose first byte
+// it contains, even if the row ends in the next range. Views borrow the map.
+template <std::size_t Width, typename Callback>
+void for_each_row(const MappedFile& file, std::size_t begin, std::size_t end, Callback&& callback) {
+    static_assert(Width > 0);
+    end = std::min(end, file.size());
+    if (begin >= end) {
+        return;
+    }
+
+    const char* const data = file.data();
+    const char* const last = data + file.size();
+    const char* const limit = data + end;
+    const char* line = data + begin;
+    if (begin == 0 || line[-1] != '\n') {
+        line = detail::next_line(line, last);
+    }
+
+    std::array<std::string_view, Width> fields;
+    while (line < limit) {
+        const char* newline = detail::find_byte(line, last, '\n');
+        const char* const line_end = newline == nullptr ? last : newline;
+        if (line != line_end) {
+#if defined(__AVX2__) && defined(__BMI2__)
+            const bool valid = last - line_end >= 31
+                ? detail::decode_padded_row(line, line_end, fields)
+                : detail::decode_row(line, line_end, fields);
+#else
+            const bool valid = detail::decode_row(line, line_end, fields);
+#endif
+            if (valid) {
+                callback(std::as_const(fields));
+            }
+        }
+        line = newline == nullptr ? last : newline + 1;
+    }
+}
+
+template <std::size_t Width, typename Callback>
+void for_each_row(const MappedFile& file, Callback&& callback) {
+    for_each_row<Width>(file, 0, file.size(), std::forward<Callback>(callback));
+}
+
+inline constexpr std::int64_t invalid_timestamp = std::numeric_limits<std::int64_t>::min();
+
+inline std::int64_t timestamp_ms(std::string_view value) noexcept {
+    const bool utc = value.size() == 20 && value[19] == 'Z';
+    const bool offset = value.size() == 25 && (value[19] == '+' || value[19] == '-');
+    if (!utc && !offset) {
+        // Parsing an unsigned integer rejects a leading sign and accepts zero padding.
+        constexpr auto maximum = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+        const auto parsed = detail::unsigned_decimal(value, maximum + 1);
+        return parsed <= maximum ? static_cast<std::int64_t>(parsed) : invalid_timestamp;
+    }
+
+    const char* const text = value.data();
+#if defined(__AVX2__) && defined(__BMI2__)
+    // Validate the ASCII layout and convert the first six pairs of digits together.
+    const auto prefix = _mm_loadu_si128(reinterpret_cast<const __m128i*>(text));
+    const auto lower = _mm_loadu_si128(reinterpret_cast<const __m128i*>("0000-00-00T00:00"));
+    const auto upper = _mm_loadu_si128(reinterpret_cast<const __m128i*>("9999-99-99T99:99"));
+    const auto bad = _mm_or_si128(_mm_cmplt_epi8(prefix, lower), _mm_cmpgt_epi8(prefix, upper));
+    if (_mm_movemask_epi8(bad) != 0 || text[16] != ':') {
+        return invalid_timestamp;
+    }
+    const auto positions = _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1);
+    const auto digits = _mm_sub_epi8(_mm_shuffle_epi8(prefix, positions), _mm_set1_epi8('0'));
+    const auto pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+    const int century = _mm_extract_epi16(pairs, 0);
+    const int year_in_century = _mm_extract_epi16(pairs, 1);
+    const int month = _mm_extract_epi16(pairs, 2);
+    const int day = _mm_extract_epi16(pairs, 3);
+    const int hour = _mm_extract_epi16(pairs, 4);
+    const int minute = _mm_extract_epi16(pairs, 5);
+#else
+    if (value[4] != '-' || value[7] != '-' || value[10] != 'T' ||
+        value[13] != ':' || value[16] != ':') {
+        return invalid_timestamp;
+    }
+    const int century = detail::decimal_pair(text);
+    const int year_in_century = detail::decimal_pair(text + 2);
+    const int month = detail::decimal_pair(text + 5);
+    const int day = detail::decimal_pair(text + 8);
+    const int hour = detail::decimal_pair(text + 11);
+    const int minute = detail::decimal_pair(text + 14);
+#endif
+    const int second = detail::decimal_pair(text + 17);
+    if (century < 0 || year_in_century < 0 || month < 1 || day < 1 ||
+        static_cast<unsigned>(hour) > 23 || static_cast<unsigned>(minute) > 59 ||
+        static_cast<unsigned>(second) > 59) {
+        return invalid_timestamp;
+    }
+    const std::chrono::year_month_day civil{
+        std::chrono::year(century * 100 + year_in_century),
+        std::chrono::month(static_cast<unsigned>(month)),
+        std::chrono::day(static_cast<unsigned>(day)),
+    };
+    if (!civil.ok()) {
+        return invalid_timestamp;
+    }
+    int offset_minutes = 0;
+    if (offset) {
+        const int offset_hour = detail::decimal_pair(text + 20);
+        const int offset_minute = detail::decimal_pair(text + 23);
+        if (value[22] != ':' || static_cast<unsigned>(offset_hour) > 23 ||
+            static_cast<unsigned>(offset_minute) > 59) {
+            return invalid_timestamp;
+        }
+        const int sign = value[19] == '+' ? 1 : -1;
+        offset_minutes = sign * (offset_hour * 60 + offset_minute);
+    }
+    const auto days = std::chrono::sys_days(civil).time_since_epoch().count();
+    return static_cast<std::int64_t>(days) * 86'400'000 +
+           ((hour * 60 + minute - offset_minutes) * 60 + second) * 1000;
+}
+
+inline std::int64_t ingest_ms(std::string_view value) noexcept {
+    return timestamp_ms(value);
+}
+
+inline std::uint32_t purchase_price(std::string_view value) noexcept {
+    const auto price = detail::unsigned_decimal(value, std::uint32_t{0});
+    return price <= 10'000'000 ? price : 0;
+}
+
+}  // namespace input
