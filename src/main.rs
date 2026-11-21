@@ -1,9 +1,7 @@
 mod aggregate;
 mod csv;
 mod keys;
-mod link_index;
 mod output;
-mod ticket;
 
 use aggregate::{Click, Event};
 use keys::{event_signature, ordered_event_key, spread, FastMap, Names};
@@ -21,7 +19,7 @@ use std::time::Instant;
 
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
-const LANES: usize = 256;
+const LANES: usize = 128;
 const CHUNK: usize = 4 << 20;
 const PRICE_MASK: u32 = (1 << 24) - 1;
 const WIDE_PURCHASE: u32 = 1 << 31;
@@ -192,56 +190,7 @@ impl Components {
     }
 }
 
-struct AliasIndex {
-    maps: Vec<FastMap<u64, u64>>,
-    filter: Vec<u64>,
-}
-
-impl AliasIndex {
-    fn new(maps: Vec<FastMap<u64, u64>>) -> Self {
-        let keys = maps.iter().map(FastMap::len).sum::<usize>();
-        if std::env::var("J2_ALIAS").as_deref() != Ok("filter") || keys == 0 {
-            return Self {
-                maps,
-                filter: Vec::new(),
-            };
-        }
-        let mut filter = vec![0u64; (keys / 4).max(16).next_power_of_two()];
-        let mask = filter.len() - 1;
-        for (&raw, &person) in maps.iter().flatten() {
-            if raw != person {
-                let hash = spread(raw);
-                filter[hash as usize & mask] |= Self::marks(hash);
-            }
-        }
-        Self { maps, filter }
-    }
-
-    #[inline]
-    fn marks(hash: u64) -> u64 {
-        (1u64 << ((hash >> 52) & 63)) | (1u64 << (hash >> 58))
-    }
-
-    #[inline]
-    fn person(&self, raw: u64, hash: u64) -> u64 {
-        if !self.filter.is_empty() {
-            let marks = Self::marks(hash);
-            if self.filter[hash as usize & (self.filter.len() - 1)] & marks != marks {
-                return raw;
-            }
-        }
-        let lane = (hash >> 32) as usize & (self.maps.len() - 1);
-        self.maps[lane].get(&raw).copied().unwrap_or(raw)
-    }
-}
-
-fn aliases(path: &Path, names: &Names, threads: usize) -> io::Result<AliasIndex> {
-    if std::env::var("J2_LINKS").as_deref() == Ok("indexed") {
-        let mut timer = Timer(Instant::now());
-        let maps = link_index::indexed_links(path, names, threads.min(4))?;
-        timer.lap("  Index links in owner groups and join (overlapped)");
-        return Ok(AliasIndex::new(maps));
-    }
+fn aliases(path: &Path, names: &Names) -> io::Result<FastMap<u64, u64>> {
     let files = csv::map_dir(&path.join("links"))?;
     let bytes: usize = files.iter().map(|file| file.len()).sum();
     let mut timer = Timer(Instant::now());
@@ -256,7 +205,7 @@ fn aliases(path: &Path, names: &Names, threads: usize) -> io::Result<AliasIndex>
     timer.lap("  Parse links and join components (overlapped)");
     let aliases = graph.into_aliases();
     timer.lap("  Assign canonical link keys (overlapped)");
-    Ok(AliasIndex::new(vec![aliases]))
+    Ok(aliases)
 }
 
 // Each worker owns its bitmap. Merge marks a signature when any worker has
@@ -350,37 +299,33 @@ struct Batch<T> {
     pending_events: Parts<Event<T>>,
     pending_clicks: Parts<Click<T>>,
     conflicts: Parts<CopyRecord<T>>,
-    compact: Parts<ticket::Ticket<T>>,
     cache: Box<[Cache]>,
     clock: csv::Clock,
 }
 
 impl<T> Batch<T> {
-    fn new(copies: usize, compact: bool) -> Self {
+    fn new(copies: usize) -> Self {
         Self {
-            events: array::from_fn(|_| Vec::with_capacity(if compact { 0 } else { copies })),
+            events: array::from_fn(|_| Vec::with_capacity(copies)),
             clicks: array::from_fn(|_| Vec::with_capacity(copies / 4)),
             pending_events: array::from_fn(|_| Vec::new()),
             pending_clicks: array::from_fn(|_| Vec::new()),
             conflicts: array::from_fn(|_| Vec::new()),
-            compact: array::from_fn(|_| Vec::with_capacity(if compact { copies } else { 0 })),
             cache: vec![ZERO_CACHE; 4096].into_boxed_slice(),
             clock: csv::Clock::new(),
         }
     }
 
     #[inline]
-    fn canonical(&mut self, raw: u64, aliases: &AliasIndex) -> (u64, usize) {
-        let hash = spread(raw);
-        let entry = &mut self.cache[hash as usize & 4095];
+    fn canonical(&mut self, raw: u64, aliases: &FastMap<u64, u64>) -> (u64, usize) {
+        let entry = &mut self.cache[spread(raw) as usize & 4095];
         if entry.raw != raw {
-            let person = aliases.person(raw, hash);
-            let owner = if raw == person {
-                (hash >> 32) as usize & (LANES - 1)
-            } else {
-                owner(person)
+            let person = aliases.get(&raw).copied().unwrap_or(raw);
+            *entry = Cache {
+                raw,
+                person,
+                owner: owner(person),
             };
-            *entry = Cache { raw, person, owner };
         }
         (entry.person, entry.owner)
     }
@@ -388,7 +333,7 @@ impl<T> Batch<T> {
 
 struct Dataset<'a> {
     dimensions: Dimensions,
-    aliases: &'a OnceLock<AliasIndex>,
+    aliases: &'a OnceLock<FastMap<u64, u64>>,
     names: &'a Names,
     ids: Names,
     click_ids: Names,
@@ -396,8 +341,6 @@ struct Dataset<'a> {
     end: i64,
     late_route: bool,
     direct_slots: bool,
-    compact_slots: bool,
-    short_ingest: bool,
     overflow: Mutex<Vec<(u32, u32)>>,
 }
 
@@ -419,50 +362,7 @@ impl Dataset<'_> {
         (index as u32) | WIDE_PURCHASE
     }
 
-    fn packed_events<T: Copy + TryFrom<i64>>(&self, input: &[u8], batch: &mut Batch<T>) {
-        let base = self.start.div_euclid(1000) - WEEK / 1000;
-        let zero = T::try_from(0).ok().unwrap();
-        let invalid = Event {
-            person: 0,
-            time: zero,
-            purchase: 0,
-        };
-        csv::event_rows(input, |row| {
-            let id = row.field::<0>();
-            if id.is_empty() {
-                return;
-            }
-            let Some(ingest) = batch.clock.timestamp(row.field::<3>()) else {
-                return;
-            };
-            let id = ordered_event_key(id, &self.ids);
-            let event = self
-                .event_fields(&row, &mut batch.clock)
-                .filter(|&(time, _)| ingest.saturating_sub(time) <= DAY)
-                .and_then(|(time, purchase)| {
-                    let time = T::try_from(time - self.start).ok()?;
-                    Some(Event {
-                        person: self.names.key(row.field::<1>()),
-                        time,
-                        purchase,
-                    })
-                })
-                .unwrap_or(invalid);
-            let copy = CopyRecord { id, ingest, event };
-            let bucket = id as usize & (LANES - 1);
-            match ticket::Ticket::pack(copy, base) {
-                Ok(ticket) => batch.compact[bucket].push(ticket),
-                Err(copy) => batch.conflicts[bucket].push(copy),
-            }
-        });
-    }
-
-    fn events<T: Copy + TryFrom<i64>>(
-        &self,
-        input: &[u8],
-        ambiguous: &[u64],
-        batch: &mut Batch<T>,
-    ) {
+    fn events<T: TryFrom<i64>>(&self, input: &[u8], ambiguous: &[u64], batch: &mut Batch<T>) {
         let aliases = (!self.late_route).then(|| self.aliases.get()).flatten();
         csv::event_rows(input, |row| {
             if row.field::<0>().is_empty() {
@@ -479,24 +379,19 @@ impl Dataset<'_> {
             if !conflict && candidate.is_none() {
                 return;
             }
-            let mut ingest = 0;
-            let payload = if !conflict && self.short_ingest {
-                candidate.filter(|&(time, _)| batch.clock.allows_ingest(time, row.field::<3>()))
-            } else {
-                let Some(value) = batch.clock.timestamp(row.field::<3>()) else {
-                    return;
-                };
-                ingest = value;
-                candidate.filter(|&(time, _)| ingest.saturating_sub(time) <= DAY)
-            }
-            .and_then(|(time, purchase)| {
-                let time = T::try_from(time - self.start).ok()?;
-                Some(Event {
-                    person: self.names.key(row.field::<1>()),
-                    time,
-                    purchase,
-                })
-            });
+            let Some(ingest) = batch.clock.timestamp(row.field::<3>()) else {
+                return;
+            };
+            let payload = candidate
+                .filter(|&(time, _)| ingest.saturating_sub(time) <= DAY)
+                .and_then(|(time, purchase)| {
+                    let time = T::try_from(time - self.start).ok()?;
+                    Some(Event {
+                        person: self.names.key(row.field::<1>()),
+                        time,
+                        purchase,
+                    })
+                });
             if conflict {
                 let (id, bucket) = if self.direct_slots {
                     let id = ordered_event_key(row.field::<0>(), &self.ids);
@@ -610,11 +505,9 @@ fn stripes<T>(parts: Vec<Parts<T>>) -> Vec<Vec<Vec<T>>> {
 fn winners<T: Copy + Send>(
     parts: Vec<Parts<CopyRecord<T>>>,
     threads: usize,
-    aliases: &AliasIndex,
+    aliases: &FastMap<u64, u64>,
     direct: bool,
 ) -> Vec<Parts<Event<T>>> {
-    let records = parts.iter().flatten().map(Vec::len).sum::<usize>();
-    let reserve = (records / threads / LANES).saturating_mul(5) / 4;
     let jobs: Vec<_> = stripes(parts)
         .into_iter()
         .map(|p| Mutex::new(Some(p)))
@@ -622,7 +515,7 @@ fn winners<T: Copy + Send>(
     work(
         jobs.len(),
         threads,
-        || array::from_fn(|_| Vec::with_capacity(reserve)),
+        || array::from_fn(|_| Vec::new()),
         |index, out| {
             let mut stripes = jobs[index].lock().unwrap().take().unwrap();
             let count = stripes.iter().map(Vec::len).sum::<usize>();
@@ -652,17 +545,10 @@ fn winners<T: Copy + Send>(
 }
 
 #[inline]
-fn emit_winner<T>(mut event: Event<T>, out: &mut Parts<Event<T>>, aliases: &AliasIndex) {
+fn emit_winner<T>(mut event: Event<T>, out: &mut Parts<Event<T>>, aliases: &FastMap<u64, u64>) {
     if event.person != 0 {
-        let raw = event.person;
-        let hash = spread(raw);
-        event.person = aliases.person(raw, hash);
-        let bucket = if event.person == raw {
-            (hash >> 32) as usize & (LANES - 1)
-        } else {
-            owner(event.person)
-        };
-        out[bucket].push(event);
+        event.person = aliases.get(&event.person).copied().unwrap_or(event.person);
+        out[owner(event.person)].push(event);
     }
 }
 
@@ -713,7 +599,7 @@ fn resolve_pending<T: Copy + Send>(
     events: Vec<Parts<Event<T>>>,
     clicks: Vec<Parts<Click<T>>>,
     threads: usize,
-    aliases: &AliasIndex,
+    aliases: &FastMap<u64, u64>,
 ) -> Vec<Forwarded<T>> {
     if events.iter().flatten().all(Vec::is_empty) && clicks.iter().flatten().all(Vec::is_empty) {
         return Vec::new();
@@ -736,16 +622,14 @@ fn resolve_pending<T: Copy + Send>(
             let (mut events, mut clicks) = jobs[index].lock().unwrap().take().unwrap();
             let canonical = &mut result.canonical;
             let mut translate = |raw| {
-                let hash = spread(raw);
-                let entry = &mut canonical[hash as usize & 16_383];
+                let entry = &mut canonical[spread(raw) as usize & 16_383];
                 if raw != entry.raw {
-                    let person = aliases.person(raw, hash);
-                    let owner = if raw == person {
-                        (hash >> 32) as usize & (LANES - 1)
-                    } else {
-                        owner(person)
+                    let person = aliases.get(&raw).copied().unwrap_or(raw);
+                    *entry = Cache {
+                        raw,
+                        person,
+                        owner: owner(person),
                     };
-                    *entry = Cache { raw, person, owner };
                 }
                 (entry.person, entry.owner)
             };
@@ -787,29 +671,14 @@ fn solve<T: Copy + Send + Ord + Into<i64> + TryFrom<i64>>(
     timer: &mut Timer,
     wait_links: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
-    let mut line_count = 0;
-    let mut line_bytes = 0;
-    for chunk in event_chunks.iter().take(8) {
-        let prefix = &chunk[..chunk.len().min(16 * 1024)];
-        if let Some(end) = prefix.iter().rposition(|&byte| byte == b'\n') {
-            line_bytes += end + 1;
-            line_count += prefix[..=end].iter().filter(|&&byte| byte == b'\n').count();
-        }
-    }
-    let row_bytes = (line_bytes / line_count.max(1)).max(45);
-    let expected = event_bytes / row_bytes / threads;
-    let estimate = (expected / LANES).saturating_mul(5) / 4;
+    let estimate = (event_bytes / 95 / threads / LANES).min(1 << 17);
     let batches = work(
         event_chunks.len() + click_chunks.len(),
         threads,
-        || Batch::<T>::new(estimate, data.compact_slots),
+        || Batch::<T>::new(estimate),
         |index, batch| {
             if index < event_chunks.len() {
-                if data.compact_slots {
-                    data.packed_events(event_chunks[index], batch);
-                } else {
-                    data.events(event_chunks[index], ambiguous, batch);
-                }
+                data.events(event_chunks[index], ambiguous, batch);
             } else {
                 data.clicks(click_chunks[index - event_chunks.len()], batch);
             }
@@ -819,26 +688,19 @@ fn solve<T: Copy + Send + Ord + Into<i64> + TryFrom<i64>>(
     let mut event_parts = Vec::with_capacity(batches.len() * 2);
     let mut click_parts = Vec::with_capacity(batches.len());
     let mut conflicts = Vec::with_capacity(batches.len());
-    let mut compact = Vec::with_capacity(batches.len());
     let mut pending_events = Vec::with_capacity(batches.len());
     let mut pending_clicks = Vec::with_capacity(batches.len());
     for batch in batches {
         event_parts.push(batch.events);
         click_parts.push(batch.clicks);
         conflicts.push(batch.conflicts);
-        compact.push(batch.compact);
         pending_events.push(batch.pending_events);
         pending_clicks.push(batch.pending_clicks);
     }
     wait_links()?;
     timer.lap("Wait for links");
     let aliases = data.aliases.get().unwrap();
-    if data.compact_slots {
-        let base = data.start.div_euclid(1000) - WEEK / 1000;
-        event_parts.extend(ticket::route(compact, conflicts, threads, aliases, base));
-    } else {
-        event_parts.extend(winners(conflicts, threads, aliases, data.direct_slots));
-    }
+    event_parts.extend(winners(conflicts, threads, aliases, data.direct_slots));
     timer.lap("Arbitrate possible duplicate IDs and route winners");
     let mut retained = Vec::new();
     for batch in resolve_pending(pending_events, pending_clicks, threads, aliases) {
@@ -863,15 +725,7 @@ fn solve<T: Copy + Send + Ord + Into<i64> + TryFrom<i64>>(
     let by_worker: Vec<(Vec<UserDay>, FastMap<(u32, i32), CampaignDay>)> = work(
         jobs.len(),
         threads,
-        || {
-            (
-                Vec::with_capacity(expected / 8),
-                FastMap::with_capacity_and_hasher(
-                    data.dimensions.campaign_ids.len() * 4,
-                    Default::default(),
-                ),
-            )
-        },
+        || (Vec::new(), FastMap::default()),
         |index, result| {
             let (mut events, mut clicks) = jobs[index].lock().unwrap().take().unwrap();
             aggregate::aggregate(
@@ -985,14 +839,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     let names = Names::default();
     let dimensions = Dimensions::load(&data)?;
     timer.lap("Map shards and load dimensions");
-    let dedup = std::env::var("J2_DEDUP").unwrap_or_else(|_| "packed".into());
-    let compact_slots = dedup == "packed";
-    let direct_slots = compact_slots || dedup == "direct";
+    let dedup = std::env::var("J2_DEDUP").unwrap_or_else(|_| "direct".into());
+    let direct_slots = dedup == "direct";
     let all_exact = direct_slots || dedup == "exact";
     let linked = OnceLock::new();
     thread::scope(|scope| -> io::Result<()> {
         let build_links = || -> io::Result<()> {
-            let values = aliases(&data, &names, workers)?;
+            let values = aliases(&data, &names)?;
             let _ = linked.set(values);
             Ok(())
         };
@@ -1031,8 +884,6 @@ fn run() -> Result<(), Box<dyn Error>> {
             end,
             late_route: std::env::var("J2_ROUTE").as_deref() == Ok("late"),
             direct_slots,
-            compact_slots,
-            short_ingest: std::env::var("J2_INGEST").as_deref() != Ok("full"),
             overflow: Mutex::new(Vec::new()),
         };
         if u32::try_from(end - (start - WEEK)).is_ok() {

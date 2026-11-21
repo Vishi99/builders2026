@@ -524,43 +524,6 @@ impl Clock {
         Some(midnight)
     }
 
-    /// A singleton copy needs the late cutoff but not the ingest timestamp.
-    #[inline]
-    pub fn allows_ingest(&mut self, event_ms: i64, bytes: &[u8]) -> bool {
-        const DAY: i64 = 86_400_000;
-        if bytes.len() != 20 || bytes[10] != b'T' || bytes[19] != b'Z' {
-            return self
-                .timestamp(bytes)
-                .is_some_and(|ingest| ingest.saturating_sub(event_ms) <= DAY);
-        }
-        let Some(midnight) = self.midnight(bytes) else {
-            return false;
-        };
-        if event_ms < midnight - DAY {
-            return false;
-        }
-        if event_ms < midnight {
-            return time_within_day(bytes)
-                .is_some_and(|clock| midnight - DAY + clock * 1000 <= event_ms);
-        }
-
-        // On or after the ingest date, a valid UTC clock is always within
-        // the cutoff. Validate eight ASCII bytes without computing seconds.
-        const HIGH: u64 = 0x8080_8080_8080_8080;
-        const LOW: u64 = u64::from_le_bytes(*b"00:00:00");
-        const MOST_HOUR: u64 = u64::from_le_bytes(*b"19:59:59");
-        const LATE_HOUR: u64 = u64::from_le_bytes(*b"23:59:59");
-        let clock = u64::from_le_bytes(bytes[11..19].try_into().unwrap());
-        let upper = if clock as u8 == b'2' {
-            LATE_HOUR
-        } else {
-            MOST_HOUR
-        };
-        let above_minimum = (clock | HIGH).wrapping_sub(LOW);
-        let below_maximum = (upper | HIGH).wrapping_sub(clock);
-        above_minimum & below_maximum & !clock & HIGH == HIGH
-    }
-
     #[inline]
     pub fn timestamp(&mut self, bytes: &[u8]) -> Option<i64> {
         let offset = match bytes.len() {

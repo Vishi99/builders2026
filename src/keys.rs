@@ -161,9 +161,7 @@ pub fn ordered_event_key(bytes: &[u8], names: &Names) -> u64 {
     // The internal name is exact and the multiplier preserves uniqueness.
     // Mix the interned index so uncommon IDs use all event partitions.
     let index = names.intern(bytes) & !LONG_ID;
-    let overflow_bit = 1u64 << 44;
-    assert!(index < overflow_bit, "too many uncommon event IDs");
-    overflow_bit | (index.wrapping_mul(0x9e37_79b9_7f4a_7c15) & (overflow_bit - 1))
+    LONG_ID | (index.wrapping_mul(0x9e37_79b9_7f4a_7c15) & !LONG_ID)
 }
 
 fn upper_number(bytes: &[u8]) -> Option<u64> {
@@ -242,4 +240,36 @@ unsafe fn numeric_eight(bytes: &[u8]) -> Option<u64> {
     let pairs = _mm_maddubs_epi16(values, _mm_set1_epi16(0x0124));
     let halves = _mm_madd_epi16(pairs, _mm_set1_epi32((1 << 16) + 1296));
     Some(_mm_cvtsi128_si32(halves) as u64 * 1_679_616 + _mm_extract_epi32::<1>(halves) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn projected_keys_preserve_exact_identifier_spelling() {
+        let names = Names::default();
+        let values: &[&[u8]] = &[
+            b"e0",
+            b"e00",
+            b"e01",
+            b"e1",
+            b"E1",
+            b"eA",
+            b"eabc",
+            b"EABC",
+            b"e abc",
+            b"unusually-long-event",
+        ];
+        let keys: std::collections::HashSet<_> = values
+            .iter()
+            .map(|key| ordered_event_key(key, &names))
+            .collect();
+        assert_eq!(keys.len(), values.len());
+        for name in values {
+            assert_eq!(
+                ordered_event_key(name, &names),
+                ordered_event_key(name, &names)
+            );
+        }
+    }
 }
