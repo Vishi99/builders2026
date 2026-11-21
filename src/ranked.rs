@@ -157,6 +157,7 @@ struct Staged {
     wide: Vec<Vec<WideTicket>>,
     spill: Parts<CopyRecord<u32>>,
     clock: csv::Clock,
+    scan_time: std::time::Duration,
 }
 
 type RunParts = [(Vec<Run>, Vec<Activity<u32>>); LANES];

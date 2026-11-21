@@ -46,6 +46,16 @@ fn work<R: Send>(
     init: impl Fn() -> R + Sync,
     visit: impl Fn(usize, &mut R) + Sync,
 ) -> Vec<R> {
+    work_with_leader(count, threads, || {}, init, visit)
+}
+
+fn work_with_leader<R: Send>(
+    count: usize,
+    threads: usize,
+    lead: impl FnOnce(),
+    init: impl Fn() -> R + Sync,
+    visit: impl Fn(usize, &mut R) + Sync,
+) -> Vec<R> {
     let threads = threads.min(count.max(1));
     let next = AtomicUsize::new(0);
     let run = || {
@@ -60,6 +70,7 @@ fn work<R: Send>(
     };
     thread::scope(|scope| {
         let tasks: Vec<_> = (1..threads).map(|_| scope.spawn(&run)).collect();
+        lead();
         let mut results = vec![run()];
         results.extend(tasks.into_iter().map(|task| task.join().unwrap()));
         results
@@ -108,14 +119,14 @@ impl<const PREFIX: u16> DimensionIds<PREFIX> {
         Some(value as usize)
     }
 
-    fn insert(&mut self, id: Vec<u8>, value: u32) {
-        if let Some(code) = Self::code(&id) {
+    fn insert(&mut self, id: &[u8], value: u32) {
+        if let Some(code) = Self::code(id) {
             if self.dense.len() <= code {
                 self.dense.resize(code + 1, 0);
             }
             self.dense[code] = value;
         } else {
-            self.sparse.insert(id, value);
+            self.sparse.insert(id.to_vec(), value);
         }
     }
 
@@ -142,35 +153,44 @@ impl Dimensions {
     fn load(path: &Path) -> io::Result<Self> {
         let product_file = fs::read(path.join("products.csv"))?;
         let mut entries = Vec::new();
-        let mut categories = vec![b"unknown".to_vec()];
+        let mut labels = vec![b"unknown".as_slice()];
+        let mut label_ids = FastMap::<&[u8], usize>::default();
+        label_ids.insert(b"unknown", 0);
         csv::rows::<2>(csv::after_header(&product_file), |[product, category]| {
             let category = if category.is_empty() {
                 b"unknown"
             } else {
                 category
             };
-            entries.push((product.to_vec(), category.to_vec()));
-            categories.push(category.to_vec());
+            let ordinal = *label_ids.entry(category).or_insert_with(|| {
+                let ordinal = labels.len();
+                labels.push(category);
+                ordinal
+            });
+            entries.push((product, ordinal));
         });
-        categories.sort_unstable();
-        categories.dedup();
-        categories.insert(0, Vec::new());
-        let category_id = |name: &[u8]| {
-            categories
-                .binary_search_by(|candidate| candidate.as_slice().cmp(name))
-                .unwrap() as u32
-        };
-        let unknown = category_id(b"unknown");
+        // Only distinct labels need sorting. Category ranks must preserve
+        // byte order for the top-category tie break.
+        let mut ordered: Vec<_> = labels.into_iter().enumerate().collect();
+        ordered.sort_unstable_by_key(|&(_, name)| name);
+        let mut categories = Vec::with_capacity(ordered.len() + 1);
+        let mut ranks = vec![0; ordered.len()];
+        categories.push(Vec::new());
+        for (ordinal, name) in ordered {
+            ranks[ordinal] = categories.len() as u32;
+            categories.push(name.to_vec());
+        }
+        let unknown = ranks[0];
         let mut products = DimensionIds::new();
-        for (product, category) in entries {
-            products.insert(product, category_id(&category));
+        for (product, ordinal) in entries {
+            products.insert(product, ranks[ordinal]);
         }
         let campaign_file = fs::read(path.join("campaigns.csv"))?;
         let mut campaign_ids = vec![b"organic".to_vec()];
         let mut channels = vec![b"organic".to_vec()];
         let mut campaigns = DimensionIds::new();
         csv::rows::<2>(csv::after_header(&campaign_file), |[campaign, channel]| {
-            campaigns.insert(campaign.to_vec(), campaign_ids.len() as u32);
+            campaigns.insert(campaign, campaign_ids.len() as u32);
             campaign_ids.push(campaign.to_vec());
             channels.push(channel.to_vec());
         });
@@ -897,6 +917,7 @@ fn write_results(
 
 fn run() -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
+    csv::configure_event_scanner()?;
     let mut timer = Timer(started);
     let data = std::env::var_os("DATA_DIR")
         .map(PathBuf::from)

@@ -8,6 +8,46 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::{self, NonNull};
 use std::slice;
+use std::sync::OnceLock;
+
+#[derive(Clone, Copy)]
+enum EventScanner {
+    Scalar,
+    Avx2,
+    Avx512,
+}
+
+static EVENT_SCANNER: OnceLock<EventScanner> = OnceLock::new();
+
+fn available_scanners() -> (bool, bool) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        return (
+            std::is_x86_feature_detected!("avx2"),
+            std::is_x86_feature_detected!("avx512bw"),
+        );
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    (false, false)
+}
+
+pub fn configure_event_scanner() -> io::Result<()> {
+    let mode = std::env::var("SHOPPING_EVENT_SCANNER").unwrap_or_else(|_| "auto".into());
+    let (avx2, avx512) = available_scanners();
+    let scanner = match mode.as_str() {
+        "auto" if avx512 => EventScanner::Avx512,
+        "auto" | "avx2" if avx2 => EventScanner::Avx2,
+        "auto" | "scalar" => EventScanner::Scalar,
+        "avx512" if avx512 => EventScanner::Avx512,
+        _ => {
+            return Err(io::Error::other(format!(
+                "unsupported event scanner: {mode}"
+            )))
+        }
+    };
+    let _ = EVENT_SCANNER.set(scanner);
+    Ok(())
+}
 
 unsafe extern "C" {
     fn mmap(
@@ -749,6 +789,7 @@ fn event_fields(bytes: &[u8], first: Block, second: Block) -> Option<EventRow<'_
         cuts
     }
 
+    #[cfg(not(feature = "split-cuts"))]
     let cuts = if n0 >= 3 {
         // Compute each half's offsets independently. Only the count of the
         // low-half delimiters is needed to stitch the two packed fields.
@@ -766,6 +807,30 @@ fn event_fields(bytes: &[u8], first: Block, second: Block) -> Option<EventRow<'_
             cuts |= end << (8 * i);
         }
         cuts
+    };
+    #[cfg(feature = "split-cuts")]
+    let cuts = {
+        // Each specialized arm extracts exactly six offsets across the two
+        // masks. The second-half offsets are relative to byte 64.
+        let offsets = match n0 {
+            3 => bulk::<3>(c0) | ((bulk::<3>(c1) | 0x40_40_40) << 24),
+            4 => bulk::<4>(c0) | ((bulk::<2>(c1) | 0x40_40) << 32),
+            5 => bulk::<5>(c0) | ((bulk::<1>(c1) | 0x40) << 40),
+            6 => bulk::<6>(c0),
+            _ => {
+                let mut cuts = 0;
+                for i in 0..6 {
+                    let end = if c0 != 0 {
+                        pull(&mut c0)
+                    } else {
+                        pull(&mut c1) + 64
+                    };
+                    cuts |= end << (8 * i);
+                }
+                cuts
+            }
+        };
+        offsets | ((length as u64) << 48)
     };
     Some(EventRow(EventFields::Short {
         bytes,
@@ -819,14 +884,40 @@ unsafe fn avx2_event_rows<'a>(bytes: &'a [u8], visit: impl FnMut(EventRow<'a, '_
     vector_event_rows(bytes, visit, |ptr| unsafe { avx2_block(ptr) });
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "bmi2",
+    feature = "avx512-intrinsics"
+))]
+#[target_feature(enable = "avx512bw")]
+unsafe fn intrinsic_event_rows<'a>(bytes: &'a [u8], visit: impl FnMut(EventRow<'a, '_>)) {
+    use std::arch::x86_64::*;
+    let lf = _mm512_set1_epi8(b'\n' as i8);
+    let comma = _mm512_set1_epi8(b',' as i8);
+    let quote = _mm512_set1_epi8(b'"' as i8);
+    vector_event_rows(bytes, visit, |ptr| unsafe {
+        // vector_event_rows bounds each load to a complete block.
+        let block = _mm512_loadu_si512(ptr.cast());
+        Block {
+            newline: _mm512_cmpeq_epi8_mask(block, lf),
+            comma: _mm512_cmpeq_epi8_mask(block, comma),
+            quote: _mm512_cmpeq_epi8_mask(block, quote),
+        }
+    });
+}
+
 pub fn event_rows<'a>(bytes: &'a [u8], mut visit: impl FnMut(EventRow<'a, '_>)) {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
-        if std::is_x86_feature_detected!("avx512bw") {
-            return vector_event_rows(bytes, visit, avx512_block);
-        }
-        if std::is_x86_feature_detected!("avx2") {
-            return unsafe { avx2_event_rows(bytes, visit) };
+        match EVENT_SCANNER.get().copied().unwrap_or(EventScanner::Scalar) {
+            EventScanner::Avx512 => {
+                #[cfg(feature = "avx512-intrinsics")]
+                return unsafe { intrinsic_event_rows(bytes, visit) };
+                #[cfg(not(feature = "avx512-intrinsics"))]
+                return vector_event_rows(bytes, visit, avx512_block);
+            }
+            EventScanner::Avx2 => return unsafe { avx2_event_rows(bytes, visit) },
+            EventScanner::Scalar => {}
         }
     }
     scalar_rows(bytes, |fields| visit(EventRow(EventFields::Wide(&fields))));
