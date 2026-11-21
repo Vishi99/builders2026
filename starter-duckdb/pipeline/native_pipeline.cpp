@@ -1,5 +1,5 @@
 #include "native_output.hpp"
-#include "native_packed_events.hpp"
+#include "native_compact_copies.hpp"
 
 #include <cstdio>
 #include <future>
@@ -34,13 +34,21 @@ extern "C" shopping::Output* shopping_run(const char* data_dir, const char* wind
         std::optional<packed_events::Input> packed;
         if (can_pack) {
             const unsigned scan_threads = threads - overlap_links;
-            packed = packed_events::scan(data, start, end, user_keys, products, scan_threads);
+            auto compact = compact_copies::scan(data, start, end, user_keys, products, scan_threads);
+            if (!compact) {
+                packed = packed_events::scan(data, start, end, user_keys, products, scan_threads);
+            }
             timer.report("Parse and partition raw events");
-            if (packed) {
+            if (compact || packed) {
                 const unsigned dedup_threads = linked.wait_for(std::chrono::seconds(0)) ==
                     std::future_status::timeout ? scan_threads : threads;
-                packed_events::deduplicate(*packed, dedup_threads);
-                timer.report("Deduplicate event tickets");
+                if (compact) {
+                    packed = compact_copies::deduplicate(*compact, dedup_threads);
+                } else {
+                    packed_events::deduplicate(*packed, dedup_threads);
+                }
+                timer.report(compact ? "Deduplicate direct event slots and partition copies"
+                                     : "Deduplicate event tickets");
             }
         }
         IdKeys click_keys;
