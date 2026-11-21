@@ -211,17 +211,20 @@ private:
 };
 
 template<class Copy>
-void reserve_copies(const std::vector<input::MappedFile>& files, Partitioned<Copy>& copies) {
+void reserve_copies(const std::vector<input::BufferedFile>& files, Partitioned<Copy>& copies) {
     size_t input_bytes = 0;
     size_t sample_bytes = 0;
     size_t sample_rows = 0;
+    std::array<char, 65'536> sample;
     for (const auto& file : files) {
         input_bytes += file.size();
         if (sample_rows >= 512 || file.size() <= 4096) {
             continue;
         }
-        const char* const end = file.data() + std::min<size_t>(file.size(), 65'536);
-        for (auto* line = input::detail::next_line(file.data(), end); line < end;) {
+        const auto bytes = std::min(file.size(), sample.size());
+        file.read(sample.data(), 0, bytes);
+        const char* const end = sample.data() + bytes;
+        for (auto* line = input::detail::next_line(sample.data(), end); line < end;) {
             const auto* newline = input::detail::find_byte(line, end, '\n');
             if (newline == nullptr) {
                 break;

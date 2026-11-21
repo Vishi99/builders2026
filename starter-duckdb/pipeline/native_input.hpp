@@ -165,6 +165,9 @@ inline CsvMasks csv_masks(const char* block) noexcept {
 }
 #endif
 
+#endif
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
 // Locate the LF and validate CSV structure from the same vector loads.
 // Every comma separates fields, and wrapping quotes account for all quotes.
 template <std::size_t Width>
@@ -178,12 +181,14 @@ inline bool read_vector_row(const char*& line, const char* last,
     std::size_t wrapped_fields = 0;
 
     auto field = [&](const char* end) {
-        const auto length = end - first;
-        // Rows follow a header, so even a leading empty field has a preceding byte.
-        const bool wrapped = (length >= 2) & (*first == '"') & (end[-1] == '"');
+        const bool wrapped = first < end && *first == '"';
+        if (wrapped && (end - first < 2 || end[-1] != '"')) {
+            return false;
+        }
         wrapped_fields += wrapped;
-        fields[column++] = std::string_view(first + wrapped, length - 2 * wrapped);
+        fields[column++] = std::string_view(first + wrapped, end - first - 2 * wrapped);
         first = end + 1;
+        return true;
     };
 
     for (; last - block >= static_cast<std::ptrdiff_t>(csv_block_bytes); block += csv_block_bytes) {
@@ -194,10 +199,12 @@ inline bool read_vector_row(const char*& line, const char* last,
         quote_count += std::popcount(masks.quotes & before_lf);
         auto commas = masks.commas & before_lf;
         while (commas != 0) {
-            if (column + 1 >= Width) {
+            const auto* comma = block + std::countr_zero(commas) / csv_mask_stride;
+            if (column + 1 >= Width || !field(comma)) {
+                line = newline == 0 ? next_line(block + csv_block_bytes, last)
+                    : block + std::countr_zero(newline) / csv_mask_stride + 1;
                 return false;
             }
-            field(block + std::countr_zero(commas));
             commas &= commas - 1;
         }
         if (newline != 0) {
@@ -206,6 +213,51 @@ inline bool read_vector_row(const char*& line, const char* last,
             return end != row_start && column + 1 == Width && field(end) &&
                    quote_count == 2 * wrapped_fields;
         }
+    }
+
+    // At the map tail, avoid reading a vector across the end of the mapping.
+    const auto* newline = find_byte(block, last, '\n');
+    const auto* end = newline == nullptr ? last : newline;
+    line = newline == nullptr ? last : newline + 1;
+    return end != row_start && decode_row(row_start, end, fields);
+}
+#endif
+
+#if defined(__AVX2__) && defined(__BMI2__)
+// Use this decoder only when the map still has enough bytes for the last load.
+// Count every quote, then prove each is one of a field's two wrapping quotes.
+template <std::size_t Width>
+inline bool decode_padded_row(const char* first, const char* last,
+                              std::array<std::string_view, Width>& fields) noexcept {
+    const auto comma_bytes = _mm256_set1_epi8(',');
+    const auto quote_bytes = _mm256_set1_epi8('"');
+    std::size_t column = 0;
+    std::size_t quote_count = 0;
+    std::size_t wrapped_fields = 0;
+    auto field = [&](const char* end) {
+        const auto length = end - first;
+        // Rows follow a header, so even a leading empty field has a preceding byte.
+        const bool wrapped = (length >= 2) & (*first == '"') & (end[-1] == '"');
+        wrapped_fields += wrapped;
+        fields[column++] = std::string_view(first + wrapped, length - 2 * wrapped);
+        first = end + 1;
+    };
+    for (const char* block = first; block < last;) {
+        const auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block));
+        const unsigned size = std::min<std::ptrdiff_t>(last - block, 32);
+        const auto quotes = _bzhi_u32(
+            static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, quote_bytes))), size);
+        auto commas = _bzhi_u32(
+            static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, comma_bytes))), size);
+        quote_count += std::popcount(quotes);
+        while (commas != 0) {
+            if (column + 1 >= Width) {
+                return false;
+            }
+            field(block + std::countr_zero(commas));
+            commas &= commas - 1;
+        }
+        block += size;
     }
     if (column + 1 != Width) {
         return false;
@@ -534,9 +586,18 @@ void for_each_row_bytes(const char* data, std::size_t size, std::size_t begin,
             }
         }
 #endif
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        const bool valid = detail::read_vector_row(line, last, fields);
+#else
         const char* newline = detail::find_byte(line, last, '\n');
         const char* const line_end = newline == nullptr ? last : newline;
+#if defined(__AVX2__) && defined(__BMI2__)
+        const bool valid = line != line_end && (last - line_end >= 31
+            ? detail::decode_padded_row(line, line_end, fields)
+            : detail::decode_row(line, line_end, fields));
+#else
         const bool valid = line != line_end && detail::decode_row(line, line_end, fields);
+#endif
         line = newline == nullptr ? last : newline + 1;
 #endif
         if (valid) {

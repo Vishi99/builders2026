@@ -3,12 +3,13 @@
 # no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
 FROM gcc:14-bookworm AS native-build
 ARG TARGETARCH
+ARG NATIVE_AMD64_ARCH=x86-64-v4
 WORKDIR /src
 COPY starter-duckdb/pipeline/*.cpp starter-duckdb/pipeline/*.hpp ./
 RUN set -eu; \
-    cpu_flags=; \
-    if [ "$TARGETARCH" = amd64 ]; then cpu_flags=-march=x86-64-v3; fi; \
-    g++ -std=c++20 -O3 -DNDEBUG -flto -fPIC -shared -pthread $cpu_flags \
+    set --; \
+    if [ "$TARGETARCH" = amd64 ]; then set -- "-march=$NATIVE_AMD64_ARCH"; fi; \
+    g++ -std=c++20 -O3 -DNDEBUG -flto -fPIC -shared -pthread "$@" \
         -static-libstdc++ -static-libgcc native_pipeline.cpp -o /shopping_native.so
 
 FROM python:3.12-slim-bookworm
