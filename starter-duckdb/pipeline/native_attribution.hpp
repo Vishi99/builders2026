@@ -255,53 +255,90 @@ void attribute_owner(const std::vector<Session>& bucket_sessions,
         }
         return;
     }
-    size_t click_count = 0;
-    size_t largest = 0;
-    for (size_t index = 0; index < worker_clicks.size(); ++index) {
-        click_count += worker_clicks[index][bucket].size();
-        if (worker_clicks[index][bucket].size() > worker_clicks[largest][bucket].size()) {
-            largest = index;
+    if (std::none_of(worker_clicks.begin(), worker_clicks.end(), [bucket](const auto& producer) {
+            return !producer[bucket].empty();
+        })) {
+        // An empty click partition credits all sessions to organic.
+        const Click* empty = nullptr;
+        credit_sessions(worker.totals, bucket_sessions.data(),
+                        bucket_sessions.data() + bucket_sessions.size(),
+                        empty, empty, click_keys, time_base);
+        return;
+    }
+    struct PersonGroup {
+        uint64_t person;
+        size_t session_end;
+        size_t click_count = 0;
+        size_t next_click = 0;
+    };
+    struct GroupClick {
+        uint64_t id;
+        Time timestamp;
+        uint32_t campaign;
+    };
+
+    // Sessions already group by person. Use their groups as exact dense IDs
+    // so we only sort a person's own clicks, comparing timestamps alone.
+    std::vector<PersonGroup> groups;
+    groups.reserve(bucket_sessions.size() / 5);
+    for (size_t start = 0; start < bucket_sessions.size();) {
+        const auto person = bucket_sessions[start].person;
+        size_t end = start + 1;
+        while (end < bucket_sessions.size() && bucket_sessions[end].person == person) {
+            ++end;
+        }
+        groups.push_back({person, end});
+        start = end;
+    }
+    IdMap index;
+    index.reserve(groups.size());
+    for (size_t group = 0; group < groups.size(); ++group) {
+        index.get_or_insert(groups[group].person, [&] { return group + 1; });
+    }
+    // Count each group's clicks and replace the person key with its group
+    // number. Clicks with no session group cannot credit or assist.
+    for (auto& producer : worker_clicks) {
+        for (auto& click : producer[bucket]) {
+            click.person = index.get(click.person, hash_id(click.person));
+            if (click.person != 0) {
+                ++groups[click.person - 1].click_count;
+            }
         }
     }
-    auto bucket_clicks = worker_clicks.empty() ? std::vector<Click>{}
-                                             : std::move(worker_clicks[largest][bucket]);
-    bucket_clicks.reserve(click_count);
-    for (size_t index = 0; index < worker_clicks.size(); ++index) {
-        if (index == largest) {
-            continue;
+    size_t total_clicks = 0;
+    for (auto& group : groups) {
+        group.next_click = total_clicks;
+        total_clicks += group.click_count;
+    }
+    // The prefix offsets give each group a contiguous time list. The
+    // compact records no longer need to carry a person key.
+    auto grouped = std::make_unique_for_overwrite<GroupClick[]>(total_clicks);
+    for (auto& producer : worker_clicks) {
+        auto& clicks = producer[bucket];
+        for (const auto& click : clicks) {
+            if (click.person != 0) {
+                auto& group = groups[click.person - 1];
+                grouped[group.next_click++] = {click.id, click.timestamp, click.campaign};
+            }
         }
-        auto& clicks = worker_clicks[index][bucket];
-        bucket_clicks.insert(bucket_clicks.end(), clicks.begin(), clicks.end());
         std::vector<Click>().swap(clicks);
     }
-    std::sort(bucket_clicks.begin(), bucket_clicks.end(), [](const Click& left, const Click& right) {
-        return left.person != right.person ? left.person < right.person
-                                           : left.timestamp < right.timestamp;
-    });
-
-    auto next_click = bucket_clicks.cbegin();
-    for (auto session = bucket_sessions.cbegin(); session != bucket_sessions.cend();) {
-        const auto person = session->person;
-        auto session_end = session + 1;
-        while (session_end != bucket_sessions.cend() && session_end->person == person) {
-            ++session_end;
+    const auto* sessions = bucket_sessions.data();
+    for (const auto& group : groups) {
+        const auto* session_end = bucket_sessions.data() + group.session_end;
+        auto* end = grouped.get() + group.next_click;
+        auto* begin = end - group.click_count;
+        if (group.click_count > 1) {
+            std::sort(begin, end, [](const GroupClick& a, const GroupClick& b) {
+                return a.timestamp < b.timestamp;
+            });
         }
-        while (next_click != bucket_clicks.cend() && next_click->person < person) {
-            ++next_click;
-        }
-        auto click_end = next_click;
-        while (click_end != bucket_clicks.cend() && click_end->person == person) {
-            ++click_end;
-        }
-        credit_sessions(worker.totals, std::to_address(session), std::to_address(session_end),
-                        std::to_address(next_click), std::to_address(click_end), click_keys, time_base);
-        if (next_click != click_end) {
-            assist_sessions(worker.totals, std::to_address(session), std::to_address(session_end),
-                            std::to_address(next_click), std::to_address(click_end),
+        credit_sessions(worker.totals, sessions, session_end, begin, end, click_keys, time_base);
+        if (begin != end) {
+            assist_sessions(worker.totals, sessions, session_end, begin, end,
                             worker.intervals, worker.touched, time_base);
         }
-        session = session_end;
-        next_click = click_end;
+        sessions = session_end;
     }
 }
 

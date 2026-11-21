@@ -43,8 +43,16 @@ make build NATIVE_AMD64_ARCH=x86-64-v4 IMAGE=shopping-avx512
 
 The scorer builds from the submitted revision and uses that revision's Dockerfile default.
 
-For a separate AVX-512 scanner experiment, build with `NATIVE_ROLLING_AVX512=1`.
-This reuses delimiter masks across event rows.
+The default AVX-512 event scanner reuses delimiter masks across rows.
+To compare the two scanners on the same Xeon, build from the same source with:
+
+```sh
+make build NATIVE_ROLLING_AVX512=1 IMAGE=shopping-rolling
+make build NATIVE_ROLLING_AVX512=0 IMAGE=shopping-per-row
+```
+
+For a scorer comparison, submit two revisions that differ only in the
+`NATIVE_ROLLING_AVX512` default in the root Dockerfile.
 
 To iterate without Docker on Linux with a C++20 compiler:
 
