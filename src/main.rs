@@ -1230,6 +1230,7 @@ fn worker(sh: &Shared, tid: usize) {
     sh.barrier.wait();
     sh.lap(tid, "sessions");
     stop_after(sh, tid, "sessions");
+    prof_from(sh, tid, "write");
     if let Err(e) = phase_write(sh, tid, &sh.outdir) {
         eprintln!("write failed: {e}");
         sh.exotic.store(true, Ordering::Relaxed);

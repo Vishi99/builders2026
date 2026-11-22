@@ -11,24 +11,51 @@ fn phase_write(sh: &Shared, tid: usize, outdir: &Path) -> std::io::Result<()> {
     let longtab = unsafe { sh.longtab.get().as_ref().unwrap() };
     let dims = &sh.dims;
     let nt = sh.nt;
+    let t0 = sys::now();
     let rows: &[URow] = &sh.local(tid).out.as_ref().unwrap().rows;
     if !rows.is_empty() || tid == 0 {
         let n = rows.len();
-        let total: usize = rows.iter().map(|r| longtab.len_of(r.pkey)).sum();
-        let mut w = pq::Writer::new(n, total + n * 30);
-        w.str_col("user_id", total, |i, out| longtab.bytes(rows[i].pkey, out));
-        w.i32_col("day", true, rows.iter().map(|r| r.day));
-        w.i32_col("sessions", false, rows.iter().map(|r| r.sessions as i32));
-        w.i32_col("events", false, rows.iter().map(|r| r.events as i32));
-        w.i64_col("revenue_cents", rows.iter().map(|r| r.revenue as i64));
+        let mut w = pq::Writer::new(n, n * 16 + 65536);
+        // user_id: one dictionary entry per run of rows with the same person.
+        let mut dict = Vec::with_capacity(n * 6);
+        let mut ids = Vec::with_capacity(n);
+        let mut runs = 0u32;
+        for i in 0..n {
+            if i == 0 || rows[i].pkey != rows[i - 1].pkey {
+                let at = dict.len();
+                dict.extend_from_slice(&[0u8; 4]);
+                longtab.bytes(rows[i].pkey, &mut dict);
+                let l = (dict.len() - at - 4) as u32;
+                dict[at..at + 4].copy_from_slice(&l.to_le_bytes());
+                runs += 1;
+            }
+            ids.push(runs - 1);
+        }
+        w.dict_raw("user_id", 6, Some(0), &dict, runs as usize, &ids);
+        let day: Vec<i32> = rows.iter().map(|r| r.day).collect();
+        w.small_i32("day", true, &day);
+        let v: Vec<i32> = rows.iter().map(|r| r.sessions as i32).collect();
+        w.small_i32("sessions", false, &v);
+        let v: Vec<i32> = rows.iter().map(|r| r.events as i32).collect();
+        w.small_i32("events", false, &v);
+        if rows.iter().all(|r| r.revenue <= i32::MAX as u64) {
+            w.i32_col("revenue_cents", false, rows.iter().map(|r| r.revenue as i32));
+        } else {
+            w.i64_col("revenue_cents", rows.iter().map(|r| r.revenue as i64));
+        }
         let cats: Vec<u32> = rows.iter().map(|r| r.cat).collect();
         w.dict_col("top_category", &cats, &dims.categories[1..], true);
-        pq::write(&ud.join(format!("part-{tid:03}.parquet")), &w.finish())?;
+        let bytes = w.finish();
+        let t1 = sys::now();
+        pq::write(&ud.join(format!("part-{tid:03}.parquet")), &bytes)?;
+        if std::env::var("SS_TIMING").is_ok() {
+            eprintln!("W t{tid}: rows {} encode {:.1} ms write {:.1} ms", rows.len(), (t1 - t0).as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e3);
+        }
     }
-    if tid != 0 {
+    if tid != nt - 1 {
         return Ok(());
     }
-    // Campaign table.
+    // Campaign table (on the last worker, so thread 0 is not serial).
     let ncamp = dims.campaign_ids.len();
     let ndays = sh.local(0).out.as_ref().unwrap().ndays;
     let day0 = sh.local(0).out.as_ref().unwrap().day0;

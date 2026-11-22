@@ -108,7 +108,7 @@ fn bit_width(max: u32) -> u8 {
     (32 - max.leading_zeros()) as u8
 }
 
-/// RLE/bit-packed hybrid as one bit-packed run.
+/// RLE/bit-packed hybrid as one bit-packed run (values must fit `width`).
 fn hybrid(out: &mut Vec<u8>, vals: impl Iterator<Item = u32>, n: usize, width: u8) {
     let groups = n.div_ceil(8);
     let mut v = ((groups as u64) << 1) | 1;
@@ -117,20 +117,27 @@ fn hybrid(out: &mut Vec<u8>, vals: impl Iterator<Item = u32>, n: usize, width: u
         v >>= 7;
     }
     out.push(v as u8);
-    let w = width as usize;
+    let w = width as u32;
     let start = out.len();
-    out.resize(start + groups * w, 0);
-    let buf = &mut out[start..];
-    for (i, x) in vals.enumerate() {
-        let bit = i * w;
-        let mut val = (x as u64) << (bit & 7);
-        let mut byte = bit >> 3;
-        while val != 0 {
-            buf[byte] |= val as u8;
-            val >>= 8;
-            byte += 1;
+    let total = groups * 8 * w as usize / 8;
+    out.reserve(total + 8);
+    let mut acc: u64 = 0;
+    let mut nb: u32 = 0;
+    for x in vals {
+        acc |= (x as u64) << nb;
+        nb += w;
+        if nb >= 32 {
+            out.extend_from_slice(&(acc as u32).to_le_bytes());
+            acc >>= 32;
+            nb -= 32;
         }
     }
+    while nb > 0 {
+        out.push(acc as u8);
+        acc >>= 8;
+        nb = nb.saturating_sub(8);
+    }
+    out.resize(start + total, 0);
 }
 
 fn page_header(out: &mut Vec<u8>, ptype: i32, size: usize, n: usize, encoding: i32, dict: bool) {
@@ -516,6 +523,54 @@ impl Writer {
             encodings: m.encodings,
         });
         self.schema.push((name, BYTE_ARRAY, Some(CONV_UTF8), optional));
+    }
+
+    /// Required column, dictionary encoded: `dict` holds `ndict` PLAIN values
+    /// (already serialized), `ids` the 0-based index of each row.
+    pub fn dict_raw(&mut self, name: &'static str, ty: i32, conv: Option<i32>, dict: &[u8], ndict: usize, ids: &[u32]) {
+        let dict_off = self.out.len() as i64;
+        page_header(&mut self.out, PAGE_DICT, dict.len(), ndict, ENC_PLAIN, true);
+        self.out.extend_from_slice(dict);
+        let width = bit_width((ndict as u32).saturating_sub(1)).max(1);
+        let mut body = Vec::with_capacity(ids.len() * width as usize / 8 + 16);
+        body.push(width);
+        hybrid(&mut body, ids.iter().copied(), ids.len(), width);
+        let data_off = self.out.len() as i64;
+        page_header(&mut self.out, PAGE_DATA, body.len(), self.rows, ENC_RLE_DICT, false);
+        self.out.extend_from_slice(&body);
+        self.metas.push(Meta {
+            ty,
+            data_offset: data_off,
+            dict_offset: Some(dict_off),
+            size: self.out.len() as i64 - dict_off,
+            encodings: vec![ENC_PLAIN, ENC_RLE, ENC_RLE_DICT],
+        });
+        self.schema.push((name, ty, conv, false));
+    }
+
+    /// Required INT32 column, dictionary encoded when values are small.
+    pub fn small_i32(&mut self, name: &'static str, date: bool, vals: &[i32]) {
+        let conv = if date { Some(CONV_DATE) } else { None };
+        let (lo, hi) = vals.iter().fold((i32::MAX, i32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+        if vals.is_empty() || (hi as i64 - lo as i64) > (1 << 20) {
+            self.i32_col(name, date, vals.iter().copied());
+            return;
+        }
+        let span = (hi - lo) as usize + 1;
+        let mut map = vec![u32::MAX; span];
+        let mut dict = Vec::new();
+        let mut n = 0u32;
+        let mut ids = Vec::with_capacity(vals.len());
+        for &v in vals {
+            let m = &mut map[(v - lo) as usize];
+            if *m == u32::MAX {
+                *m = n;
+                n += 1;
+                dict.extend_from_slice(&v.to_le_bytes());
+            }
+            ids.push(*m);
+        }
+        self.dict_raw(name, INT32, conv, &dict, n as usize, &ids);
     }
 
     pub fn finish(mut self) -> Vec<u8> {
