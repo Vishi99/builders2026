@@ -6,7 +6,8 @@ PLATFORM ?= linux/amd64
 NATIVE_AMD64_ARCH ?= x86-64-v3
 RUST_VERSION ?= 1.89.0
 SHOPPING_FEATURES ?=
-SHOPPING_EVENT_SCANNER ?= auto
+SHOPPING_EVENT_SCANNER ?= tokens
+SHOPPING_INPUT ?= pread
 DEV   ?= dev
 # In the monorepo the fixtures live two levels up; the published starter has its own copy.
 FIXTURES ?= $(if $(wildcard fixtures),fixtures,../../fixtures)
@@ -19,6 +20,7 @@ build:
 	docker buildx build --platform $(PLATFORM) --build-arg NATIVE_AMD64_ARCH=$(NATIVE_AMD64_ARCH) \
 		--build-arg RUST_VERSION=$(RUST_VERSION) --build-arg SHOPPING_FEATURES="$(SHOPPING_FEATURES)" \
 		--build-arg SHOPPING_EVENT_SCANNER=$(SHOPPING_EVENT_SCANNER) \
+		--build-arg SHOPPING_INPUT=$(SHOPPING_INPUT) \
 		--load -t $(IMAGE) ..
 
 ## Build the native library for running pipeline.py directly on Linux

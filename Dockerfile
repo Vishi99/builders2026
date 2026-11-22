@@ -11,8 +11,10 @@ RUN set -eu; \
     cargo build --locked --release --features "$SHOPPING_FEATURES"
 
 FROM debian:bookworm-slim
-ARG SHOPPING_EVENT_SCANNER=auto
+ARG SHOPPING_EVENT_SCANNER=tokens
+ARG SHOPPING_INPUT=pread
 ENV SHOPPING_EVENT_SCANNER=$SHOPPING_EVENT_SCANNER
+ENV J2_INPUT=$SHOPPING_INPUT
 COPY --from=build /build/target/release/shopping-sessions /usr/local/bin/shopping-sessions
 USER 1000:1000
 CMD ["/usr/local/bin/shopping-sessions"]

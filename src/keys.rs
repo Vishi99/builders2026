@@ -149,11 +149,14 @@ fn unpack_short(id: u64) -> ([u8; 9], usize) {
 }
 
 #[inline]
-fn short_key(bytes: &[u8]) -> Option<u64> {
+pub(crate) fn short_key(bytes: &[u8]) -> Option<u64> {
     if bytes.len() > 9 {
         return None;
     }
-    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "bmi2")
+    ))]
     if bytes.len() >= 8 {
         let prefix = u64::from_be_bytes(bytes[..8].try_into().unwrap());
         let tail = bytes.get(8).copied().unwrap_or(0);
@@ -164,7 +167,16 @@ fn short_key(bytes: &[u8]) -> Option<u64> {
             return None;
         }
         // SAFETY: This path is compiled only when the target supports BMI2.
+        #[cfg(target_arch = "x86_64")]
         let packed = unsafe { std::arch::x86_64::_pext_u64(prefix, !high) };
+        #[cfg(target_arch = "aarch64")]
+        let packed = {
+            // Close the top-bit gaps in groups of two, four, then eight
+            // bytes. All input bytes already passed the ASCII check.
+            let pairs = (prefix & 0x007f_007f_007f_007f) | ((prefix & 0x7f00_7f00_7f00_7f00) >> 1);
+            let fours = (pairs & 0x0000_3fff_0000_3fff) | ((pairs & 0x3fff_0000_3fff_0000) >> 2);
+            (fours & 0x0000_0000_0fff_ffff) | ((fours & 0x0fff_ffff_0000_0000) >> 4)
+        };
         return Some((packed << 7) | u64::from(tail));
     }
     let mut result = 0u64;

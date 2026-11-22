@@ -10,7 +10,7 @@ mod ranked;
 mod user_rank;
 
 use aggregate::{Click, Event};
-use keys::{byte_hash, spread, FastMap, Names};
+use keys::{byte_hash, short_key, spread, FastMap, Names};
 use output::{CampaignDay, UserDay};
 use serde_json::Value;
 use std::array;
@@ -26,7 +26,8 @@ use std::time::Instant;
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const LANES: usize = 128;
-const CHUNK: usize = 4 << 20;
+const CHUNK: usize = 16 << 20;
+const OFFSET_BITS: u32 = CHUNK.ilog2() + 1;
 const PRICE_MASK: u32 = (1 << 24) - 1;
 const WIDE_PURCHASE: u32 = 1 << 31;
 
@@ -321,7 +322,8 @@ fn count_duplicates(input: &[&[u8]], bytes: usize, threads: usize) -> Vec<u64> {
         || vec![CensusWord::default(); words],
         |i, local| {
             csv::event_ids(input[i], |id| {
-                let (word, mask) = census_position(byte_hash(id), words);
+                let hash = short_key(id).map_or_else(|| byte_hash(id), spread);
+                let (word, mask) = census_position(hash, words);
                 let cell = &mut local[word];
                 cell.repeat |= cell.seen & mask;
                 cell.seen |= mask;
@@ -376,36 +378,199 @@ struct CopyRecord<T> {
     event: Event<T>,
 }
 
-struct EventId<'a> {
-    bytes: &'a [u8],
-    hash: u64,
-}
+/// Location of a decoded first field in the mapped input. The chunker
+/// can extend a chunk past its target for the last row only, so even a
+/// very long ID starts within the first CHUNK bytes of that chunk.
+#[derive(Clone, Copy)]
+struct IdLocation(u64);
 
-impl PartialEq for EventId<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash && self.bytes == other.bytes
+impl IdLocation {
+    #[inline]
+    fn new(chunk: &[u8], index: usize, id: &[u8]) -> Self {
+        let offset = id.as_ptr() as usize - chunk.as_ptr() as usize;
+        debug_assert!(offset <= CHUNK && index <= u32::MAX as usize);
+        Self(((index as u64) << OFFSET_BITS) | offset as u64)
+    }
+
+    #[inline]
+    fn bytes<'a>(self, chunks: &[&'a [u8]]) -> &'a [u8] {
+        let chunk = chunks[(self.0 >> OFFSET_BITS) as usize];
+        let offset = (self.0 & ((1 << OFFSET_BITS) - 1)) as usize;
+        let tail = &chunk[offset..];
+        // The location already skips any opening quote. A valid CSV ID
+        // stops at its closing quote or at the following comma.
+        let end = tail.iter().position(|&b| matches!(b, b',' | b'"')).unwrap();
+        &tail[..end]
     }
 }
 
-impl Eq for EventId<'_> {}
-
-struct EventCopy<'a, T> {
-    id: EventId<'a>,
-    ingest: i64,
-    event: Event<T>,
+/// Put short IDs directly in the key and encode longer IDs as a location
+/// with a hash. The low hash bits already chose a partition. Within it,
+/// the retained bits distribute lookups and byte equality resolves collisions.
+#[derive(Clone, Copy)]
+struct EventKeyLayout {
+    bits: u32,
+    location_mask: u64,
+    copied: bool,
 }
 
-struct Batch<'a, T> {
+impl EventKeyLayout {
+    const BY_LOCATION: u64 = 1 << 63;
+
+    fn new(chunks: usize, bytes: usize, copied: bool) -> Self {
+        let bits = if copied {
+            // A worker cannot copy more ID bytes (including separators)
+            // than it read from the CSV.
+            usize::BITS - bytes.saturating_sub(1).leading_zeros()
+        } else {
+            OFFSET_BITS + usize::BITS - chunks.saturating_sub(1).leading_zeros()
+        };
+        assert!(bits < 63);
+        Self {
+            bits,
+            location_mask: (1 << bits) - 1,
+            copied,
+        }
+    }
+
+    #[inline]
+    fn long_key(
+        self,
+        input: &[u8],
+        chunk: usize,
+        id: &[u8],
+        hash: u64,
+        arena: &mut Vec<u8>,
+    ) -> u64 {
+        let location = if self.copied {
+            let offset = arena.len();
+            arena.extend_from_slice(id);
+            arena.push(b',');
+            IdLocation(offset as u64)
+        } else {
+            IdLocation::new(input, chunk, id)
+        };
+        self.pack(location, hash)
+    }
+
+    #[inline]
+    fn pack(self, id: IdLocation, hash: u64) -> u64 {
+        (((hash >> LANES.trailing_zeros()) << self.bits) & !Self::BY_LOCATION)
+            | Self::BY_LOCATION
+            | id.0
+    }
+
+    #[inline]
+    fn hash(self, key: u64) -> u64 {
+        if key & Self::BY_LOCATION == 0 {
+            spread(key) >> LANES.trailing_zeros()
+        } else {
+            key >> self.bits
+        }
+    }
+
+    #[inline]
+    fn location(self, key: u64) -> IdLocation {
+        IdLocation(key & self.location_mask)
+    }
+
+    #[inline]
+    fn same_id(self, a: u64, b: u64, chunks: &[&[u8]], a_arena: &[u8], b_arena: &[u8]) -> bool {
+        if a & b & Self::BY_LOCATION == 0 {
+            return a == b;
+        }
+        if self.copied {
+            // Equal offsets in different workers' arenas can point to
+            // different IDs. Compare the original bytes in every case.
+            return self.copied_id(a, a_arena) == self.copied_id(b, b_arena);
+        }
+        a == b || self.location(a).bytes(chunks) == self.location(b).bytes(chunks)
+    }
+
+    #[inline]
+    fn copied_id(self, key: u64, arena: &[u8]) -> &[u8] {
+        let tail = &arena[self.location(key).0 as usize..];
+        &tail[..tail.iter().position(|&b| b == b',').unwrap()]
+    }
+}
+
+struct EventCopy<T> {
+    key: u64,
+    person: u64,
+    time: T,
+    stamp: u32,
+}
+
+struct EventDetails {
+    ingest: i64,
+    purchase: u32,
+}
+
+#[derive(Default)]
+struct EventSpill {
+    details: Vec<EventDetails>,
+    long_ids: Vec<u8>,
+}
+
+const EXTENDED_STAMP: u32 = 1 << 31;
+
+impl<T> EventCopy<T> {
+    #[inline]
+    fn new(
+        key: u64,
+        ingest: i64,
+        event: Event<T>,
+        base: i64,
+        details: &mut Vec<EventDetails>,
+    ) -> Self {
+        let relative = ingest.saturating_sub(base) as u64;
+        let stamp = if relative < u64::from(EXTENDED_STAMP) && event.purchase == 0 {
+            relative as u32
+        } else {
+            // Purchases and outlying ingest times share a side buffer.
+            // The common record stays 24 bytes for a 32-bit event time.
+            let offset = u32::try_from(details.len()).unwrap();
+            assert!(offset < EXTENDED_STAMP);
+            details.push(EventDetails {
+                ingest,
+                purchase: event.purchase,
+            });
+            EXTENDED_STAMP | offset
+        };
+        Self {
+            key,
+            person: event.person,
+            time: event.time,
+            stamp,
+        }
+    }
+
+    #[inline]
+    fn extras<'a>(&self, details: &'a [EventDetails]) -> Option<&'a EventDetails> {
+        (self.stamp >= EXTENDED_STAMP).then(|| &details[(self.stamp ^ EXTENDED_STAMP) as usize])
+    }
+
+    #[inline]
+    fn ingest(&self, base: i64, details: &[EventDetails]) -> i64 {
+        self.extras(details)
+            .map_or_else(|| base + i64::from(self.stamp), |extra| extra.ingest)
+    }
+}
+
+struct Batch<T> {
     events: Parts<Event<T>>,
     clicks: Parts<Click<T>>,
     pending_events: Parts<Event<T>>,
     pending_clicks: Parts<Click<T>>,
-    conflicts: Parts<EventCopy<'a, T>>,
+    conflicts: Parts<EventCopy<T>>,
+    spill: EventSpill,
     cache: Box<[Cache]>,
     clock: csv::Clock,
+    event_scan: std::time::Duration,
+    click_scan: std::time::Duration,
 }
 
-impl<T> Batch<'_, T> {
+impl<T> Batch<T> {
     fn new(estimate: usize, all_exact: bool) -> Self {
         Self {
             events: array::from_fn(|_| Vec::with_capacity(if all_exact { 0 } else { estimate })),
@@ -413,8 +578,11 @@ impl<T> Batch<'_, T> {
             pending_events: array::from_fn(|_| Vec::new()),
             pending_clicks: array::from_fn(|_| Vec::new()),
             conflicts: array::from_fn(|_| Vec::with_capacity(if all_exact { estimate } else { 0 })),
+            spill: EventSpill::default(),
             cache: vec![ZERO_CACHE; 4096].into_boxed_slice(),
             clock: csv::Clock::new(),
+            event_scan: Default::default(),
+            click_scan: Default::default(),
         }
     }
 
@@ -468,11 +636,13 @@ impl Dataset<'_> {
         (index as u32) | WIDE_PURCHASE
     }
 
-    fn events<'a, T: TryFrom<i64>>(
+    fn events<T: TryFrom<i64>>(
         &self,
-        input: &'a [u8],
+        input: &[u8],
+        chunk: usize,
+        keys: EventKeyLayout,
         ambiguous: &[u64],
-        batch: &mut Batch<'a, T>,
+        batch: &mut Batch<T>,
     ) {
         let aliases = (!self.late_route).then(|| self.aliases.get()).flatten();
         csv::event_rows(input, |row| {
@@ -480,7 +650,10 @@ impl Dataset<'_> {
             if id.is_empty() {
                 return;
             }
-            let hash = byte_hash(id);
+            // Most IDs fit exactly in a machine word. Hash that reversible
+            // byte encoding and keep it directly in their staged records.
+            let short = short_key(id);
+            let hash = short.map_or_else(|| byte_hash(id), spread);
             // A clear bit certifies uniqueness. Both set bits still require
             // arbitration against the original ID bytes.
             let conflict = if ambiguous.is_empty() {
@@ -513,11 +686,16 @@ impl Dataset<'_> {
                     time: T::try_from(0).ok().unwrap(),
                     purchase: 0,
                 });
-                batch.conflicts[bucket].push(EventCopy {
-                    id: EventId { bytes: id, hash },
+                let key = short.unwrap_or_else(|| {
+                    keys.long_key(input, chunk, id, hash, &mut batch.spill.long_ids)
+                });
+                batch.conflicts[bucket].push(EventCopy::new(
+                    key,
                     ingest,
                     event,
-                });
+                    self.start - DAY,
+                    &mut batch.spill.details,
+                ));
             } else if let Some(mut event) = payload {
                 if let Some(aliases) = aliases {
                     let (person, owner) = batch.canonical(event.person, aliases);
@@ -560,7 +738,7 @@ impl Dataset<'_> {
     fn clicks<T: TryFrom<i64>>(
         &self,
         input: &[u8],
-        batch: &mut Batch<'_, T>,
+        batch: &mut Batch<T>,
         click_key: impl Fn(&[u8]) -> u64,
     ) {
         let base = self.start - WEEK;
@@ -620,11 +798,26 @@ fn stripes<T>(parts: Vec<Parts<T>>) -> Vec<Vec<Vec<T>>> {
 }
 
 fn winners<T: Copy + Send>(
-    parts: Vec<Parts<EventCopy<'_, T>>>,
+    parts: Vec<(Parts<EventCopy<T>>, EventSpill)>,
+    chunks: &[&[u8]],
+    keys: EventKeyLayout,
+    base: i64,
     threads: usize,
     aliases: &FastMap<u64, u64>,
 ) -> Vec<Parts<Event<T>>> {
-    let jobs: Vec<_> = stripes(parts)
+    let mut partitions: Vec<_> = (0..LANES)
+        .map(|_| Vec::with_capacity(parts.len()))
+        .collect();
+    let mut details = Vec::with_capacity(parts.len());
+    for (worker, (part, extra)) in parts.into_iter().enumerate() {
+        details.push(extra);
+        for (partition, rows) in partitions.iter_mut().zip(part) {
+            if !rows.is_empty() {
+                partition.push((rows, worker));
+            }
+        }
+    }
+    let jobs: Vec<_> = partitions
         .into_iter()
         .map(|p| Mutex::new(Some(p)))
         .collect();
@@ -634,14 +827,19 @@ fn winners<T: Copy + Send>(
         || (array::from_fn(|_| Vec::new()), vec![ZERO_CACHE; 4096]),
         |index, (out, cache)| {
             let mut stripes = jobs[index].lock().unwrap().take().unwrap();
-            let count = stripes.iter().map(Vec::len).sum::<usize>();
-            select_event_winners(&mut stripes, count);
-            for rows in stripes {
-                for mut row in rows {
-                    if row.event.person != 0 {
-                        let (person, target) = cached_owner(cache, row.event.person, aliases);
-                        row.event.person = person;
-                        out[target].push(row.event);
+            let count = stripes.iter().map(|(rows, _)| rows.len()).sum::<usize>();
+            select_event_winners(&mut stripes, count, chunks, keys, base, &details);
+            for (rows, worker) in stripes {
+                let details = &details[worker].details;
+                for row in rows {
+                    if row.person != 0 {
+                        let (person, target) = cached_owner(cache, row.person, aliases);
+                        let purchase = row.extras(details).map_or(0, |extra| extra.purchase);
+                        out[target].push(Event {
+                            person,
+                            time: row.time,
+                            purchase,
+                        });
                     }
                 }
             }
@@ -652,41 +850,100 @@ fn winners<T: Copy + Send>(
     .collect()
 }
 
-fn select_event_winners<T>(stripes: &mut [Vec<EventCopy<'_, T>>], count: usize) {
+fn select_event_winners<T>(
+    stripes: &mut [(Vec<EventCopy<T>>, usize)],
+    count: usize,
+    chunks: &[&[u8]],
+    keys: EventKeyLayout,
+    base: i64,
+    details: &[EventSpill],
+) {
     // Each partition owns its table. Slots store a fingerprint and the
     // winning record's location so probing stays in a compact array.
     let size = (count + count / 3 + 1).next_power_of_two();
-    let mut slots = vec![0u64; size];
+    if stripes.len() <= 32 && stripes.iter().all(|(rows, _)| rows.len() < (1 << 18)) {
+        let mut slots = vec![0u32; size];
+        probe_event_winners::<T, u32, 18, 9>(stripes, chunks, keys, base, details, &mut slots);
+    } else {
+        let mut slots = vec![0u64; size];
+        probe_event_winners::<T, u64, 32, 16>(stripes, chunks, keys, base, details, &mut slots);
+    }
+}
+
+trait WinnerSlot: Copy + Into<u64> {
+    fn store(value: u64) -> Self;
+}
+
+impl WinnerSlot for u32 {
+    #[inline(always)]
+    fn store(value: u64) -> Self {
+        debug_assert!(u32::try_from(value).is_ok());
+        value as u32
+    }
+}
+
+impl WinnerSlot for u64 {
+    #[inline(always)]
+    fn store(value: u64) -> Self {
+        value
+    }
+}
+
+fn probe_event_winners<T, W: WinnerSlot, const ROW_BITS: u32, const TAG_BITS: u32>(
+    stripes: &mut [(Vec<EventCopy<T>>, usize)],
+    chunks: &[&[u8]],
+    keys: EventKeyLayout,
+    base: i64,
+    details: &[EventSpill],
+    slots: &mut [W],
+) {
+    let index_mask = (1u64 << ROW_BITS) - 1;
+    let fingerprint_mask = (1u64 << TAG_BITS) - 1;
+    let table_mask = slots.len() - 1;
     for stripe in 0..stripes.len() {
-        for index in 0..stripes[stripe].len() {
-            let current = &stripes[stripe][index];
-            let hash = current.id.hash;
-            let fingerprint = hash >> 48;
-            let location = ((stripe as u64) << 32) | (index as u64 + 1);
-            let handle = (location << 16) | fingerprint;
-            let mut probe = (hash >> LANES.trailing_zeros()) as usize & (size - 1);
+        for index in 0..stripes[stripe].0.len() {
+            let current = &stripes[stripe].0[index];
+            let hash = keys.hash(current.key);
+            let fingerprint = hash >> 18 & fingerprint_mask;
+            let location = ((stripe as u64) << ROW_BITS) | (index as u64 + 1);
+            let handle = W::store((location << TAG_BITS) | fingerprint);
+            let mut probe = hash as usize & table_mask;
             loop {
                 let slot = &mut slots[probe];
-                let prior = *slot;
+                let prior = (*slot).into();
                 if prior == 0 {
                     *slot = handle;
                     break;
                 }
-                if prior & 0xffff == fingerprint {
-                    let other_stripe = (prior >> 48) as usize;
-                    let other_index = ((prior >> 16) as u32 - 1) as usize;
-                    let other = &stripes[other_stripe][other_index];
-                    if current.id == other.id {
-                        if current.ingest < other.ingest {
-                            stripes[other_stripe][other_index].event.person = 0;
+                if prior & fingerprint_mask == fingerprint {
+                    let other_stripe = (prior >> (ROW_BITS + TAG_BITS)) as usize;
+                    let other_index = ((prior >> TAG_BITS & index_mask) - 1) as usize;
+                    let other = &stripes[other_stripe].0[other_index];
+                    if hash == keys.hash(other.key)
+                        && keys.same_id(
+                            current.key,
+                            other.key,
+                            chunks,
+                            &details[stripes[stripe].1].long_ids,
+                            &details[stripes[other_stripe].1].long_ids,
+                        )
+                    {
+                        let earlier = if (current.stamp | other.stamp) < EXTENDED_STAMP {
+                            current.stamp < other.stamp
+                        } else {
+                            current.ingest(base, &details[stripes[stripe].1].details)
+                                < other.ingest(base, &details[stripes[other_stripe].1].details)
+                        };
+                        if earlier {
+                            stripes[other_stripe].0[other_index].person = 0;
                             *slot = handle;
                         } else {
-                            stripes[stripe][index].event.person = 0;
+                            stripes[stripe].0[index].person = 0;
                         }
                         break;
                     }
                 }
-                probe = (probe + 1) & (size - 1);
+                probe = (probe + 1) & table_mask;
             }
         }
     }
@@ -790,8 +1047,8 @@ fn resolve_pending<T: Copy + Send>(
 
 fn solve<T: Copy + Send + Ord + Into<i64> + TryFrom<i64>>(
     data: Dataset<'_>,
-    event_chunks: &[&[u8]],
-    click_chunks: &[&[u8]],
+    event_input: &[csv::InputChunk<'_>],
+    click_input: &[csv::InputChunk<'_>],
     event_bytes: usize,
     ambiguous: &[u64],
     threads: usize,
@@ -799,51 +1056,93 @@ fn solve<T: Copy + Send + Ord + Into<i64> + TryFrom<i64>>(
     timer: &mut Timer,
     wait_links: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
+    let event_chunks: Vec<_> = event_input.iter().map(|chunk| chunk.mapped()).collect();
+    let click_chunks: Vec<_> = click_input.iter().map(|chunk| chunk.mapped()).collect();
     let estimate = (event_bytes / 75 / threads / LANES).min(1 << 17);
-    // The input stays mapped until attribution finishes. A click ID is
-    // needed only for ties, so keep a location instead of interning it.
-    let borrow_click_ids = click_chunks.len() <= u32::MAX as usize
-        && click_chunks
-            .iter()
-            .all(|chunk| chunk.len() <= u32::MAX as usize);
+    assert!(event_chunks.len().max(click_chunks.len()) <= u32::MAX as usize);
+    let profile_scan = std::env::var_os("SHOPPING_PROFILE_SCAN").as_deref() == Some("1".as_ref());
+    let buffered = std::env::var_os("J2_INPUT").as_deref() == Some("pread".as_ref());
+    let keys = EventKeyLayout::new(event_chunks.len(), event_bytes, buffered);
     let batches = work(
         event_chunks.len() + click_chunks.len(),
         threads,
-        || Batch::<T>::new(estimate, ambiguous.is_empty()),
-        |index, batch| {
-            if index < event_chunks.len() {
-                data.events(event_chunks[index], ambiguous, batch);
+        || {
+            (
+                Batch::<T>::new(estimate, ambiguous.is_empty()),
+                Vec::new(),
+                Ok(()),
+            )
+        },
+        |index, (batch, buffer, status)| {
+            if status.is_err() {
+                return;
+            }
+            let started = profile_scan.then(Instant::now);
+            let (job, offset, is_event) = if index < event_input.len() {
+                (event_input[index], index, true)
             } else {
-                let chunk_index = index - event_chunks.len();
-                let chunk = click_chunks[chunk_index];
-                data.clicks(chunk, batch, |id| {
-                    if borrow_click_ids {
-                        let offset = id.as_ptr() as usize - chunk.as_ptr() as usize;
-                        ((chunk_index as u64) << 32) | offset as u64
-                    } else {
-                        data.click_ids.key(id)
+                let offset = index - event_input.len();
+                (click_input[offset], offset, false)
+            };
+            let bytes = if buffered {
+                match job.read_into(buffer) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        *status = Err(error);
+                        return;
                     }
-                });
+                }
+            } else {
+                job.mapped()
+            };
+            // A buffered event keeps its long ID in the worker arena;
+            // click tie-breaks keep their locations in the original file.
+            if is_event {
+                data.events(bytes, offset, keys, ambiguous, batch);
+                if let Some(started) = started {
+                    batch.event_scan += started.elapsed();
+                }
+            } else {
+                data.clicks(bytes, batch, |id| IdLocation::new(bytes, offset, id).0);
+                if let Some(started) = started {
+                    batch.click_scan += started.elapsed();
+                }
             }
         },
     );
     timer.lap("Validate rows and partition canonical events and clicks");
+    if profile_scan {
+        let events: std::time::Duration =
+            batches.iter().map(|(batch, _, _)| batch.event_scan).sum();
+        let clicks: std::time::Duration =
+            batches.iter().map(|(batch, _, _)| batch.click_scan).sum();
+        eprintln!("  event scan worker time: {:.6}s", events.as_secs_f64());
+        eprintln!("  click scan worker time: {:.6}s", clicks.as_secs_f64());
+    }
     let mut event_parts = Vec::with_capacity(batches.len() * 2);
     let mut click_parts = Vec::with_capacity(batches.len());
     let mut conflicts = Vec::with_capacity(batches.len());
     let mut pending_events = Vec::with_capacity(batches.len());
     let mut pending_clicks = Vec::with_capacity(batches.len());
-    for batch in batches {
+    for (batch, _, status) in batches {
+        status?;
         event_parts.push(batch.events);
         click_parts.push(batch.clicks);
-        conflicts.push(batch.conflicts);
+        conflicts.push((batch.conflicts, batch.spill));
         pending_events.push(batch.pending_events);
         pending_clicks.push(batch.pending_clicks);
     }
     wait_links()?;
     timer.lap("Wait for links");
     let aliases = data.aliases.get().unwrap();
-    event_parts.extend(winners(conflicts, threads, aliases));
+    event_parts.extend(winners(
+        conflicts,
+        &event_chunks,
+        keys,
+        data.start - DAY,
+        threads,
+        aliases,
+    ));
     timer.lap("Arbitrate possible duplicate IDs and route winners");
     let mut retained = Vec::new();
     for batch in resolve_pending(pending_events, pending_clicks, threads, aliases) {
@@ -865,20 +1164,10 @@ fn solve<T: Copy + Send + Ord + Into<i64> + TryFrom<i64>>(
         .zip(clicks)
         .map(|pair| Mutex::new(Some(pair)))
         .collect();
-    let click_id = |location: u64| {
-        let chunk = click_chunks[(location >> 32) as usize];
-        let tail = &chunk[location as u32 as usize..];
-        // The location starts after a possible opening quote. The CSV
-        // dialect excludes literal commas and quotes inside the value.
-        let end = tail.iter().position(|&b| matches!(b, b',' | b'"')).unwrap();
-        &tail[..end]
-    };
     let compare_clicks = |a, b| {
-        if borrow_click_ids {
-            click_id(a).cmp(click_id(b))
-        } else {
-            data.click_ids.compare(a, b)
-        }
+        IdLocation(a)
+            .bytes(&click_chunks)
+            .cmp(IdLocation(b).bytes(&click_chunks))
     };
     let by_worker: Vec<(Vec<UserDay>, aggregate::CampaignGrid)> = work(
         jobs.len(),
@@ -1020,8 +1309,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     let clicks = csv::map_dir(&data.join("clicks"))?;
     let event_bytes = events.iter().map(|f| f.len()).sum::<usize>();
     let click_bytes = clicks.iter().map(|f| f.len()).sum::<usize>();
-    let event_chunks = csv::chunks(&events, CHUNK);
-    let click_chunks = csv::chunks(&clicks, CHUNK);
+    let event_input = csv::input_chunks(&events, CHUNK);
+    let click_input = csv::input_chunks(&clicks, CHUNK);
+    let event_chunks: Vec<_> = event_input.iter().map(|chunk| chunk.mapped()).collect();
     let names = Names::default();
     let dimensions = Dimensions::load(&data)?;
     timer.lap("Map shards and load dimensions");
@@ -1054,6 +1344,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     late_route: false,
                     overflow: Mutex::new(Vec::new()),
                 };
+                let click_chunks: Vec<_> = click_input.iter().map(|chunk| chunk.mapped()).collect();
                 ranked::solve(
                     dataset,
                     layout,
@@ -1118,8 +1409,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         if u32::try_from(end - (start - WEEK)).is_ok() {
             solve::<u32>(
                 dataset,
-                &event_chunks,
-                &click_chunks,
+                &event_input,
+                &click_input,
                 event_bytes,
                 &ambiguous,
                 workers,
@@ -1130,8 +1421,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         } else {
             solve::<i64>(
                 dataset,
-                &event_chunks,
-                &click_chunks,
+                &event_input,
+                &click_input,
                 event_bytes,
                 &ambiguous,
                 workers,
@@ -1161,31 +1452,64 @@ mod opaque_id_tests {
 
     #[test]
     fn earliest_invalid_copy_wins_without_merging_hash_collisions() {
-        let record = |bytes, ingest, person| EventCopy {
-            id: EventId {
-                bytes,
+        let keys = EventKeyLayout::new(3, 0, false);
+        let mut detail = Vec::new();
+        let mut record = |chunk: u64, offset: u64, ingest, person, purchase| {
+            EventCopy::new(
                 // Force the full fingerprint to collide.
-                hash: 42,
-            },
-            ingest,
-            event: Event {
-                person,
-                time: 0u32,
-                purchase: 0,
-            },
+                keys.pack(IdLocation((chunk << OFFSET_BITS) | offset), 12345),
+                ingest,
+                Event {
+                    person,
+                    time: 0u32,
+                    purchase,
+                },
+                0,
+                &mut detail,
+            )
         };
-        let long = &b"e0123456789abcdef0123456789abcdef"[..];
-        let mut stripes = [
-            vec![record(long, 12, 7), record(b"other", 4, 3)],
-            vec![record(long, 10, 0), record(b"other", 1, 4)],
-            vec![record(long, 11, 8)],
+        let chunks = [
+            &b"e0123456789abcdef0123456789abcdef,x"[..],
+            &b"\"e0123456789abcdef0123456789abcdef\",x"[..],
+            &b"other,x"[..],
         ];
-        select_event_winners(&mut stripes, 5);
+        let mut stripes = [
+            (vec![record(0, 0, 12, 7, 0), record(2, 0, 4, 3, 0)], 0),
+            (vec![record(1, 1, -10, 0, 0), record(2, 0, 1, 4, 99)], 0),
+            (vec![record(0, 0, 11, 8, 0)], 0),
+        ];
+        let details = [EventSpill {
+            details: detail,
+            long_ids: Vec::new(),
+        }];
+        select_event_winners(&mut stripes, 5, &chunks, keys, 0, &details);
         let people: Vec<_> = stripes
             .iter()
-            .flatten()
-            .map(|row| row.event.person)
+            .flat_map(|(rows, _)| rows.iter())
+            .map(|row| row.person)
             .collect();
         assert_eq!(people, [0, 0, 0, 4, 0]);
+        assert_eq!(
+            stripes[1].0[1]
+                .extras(&details[0].details)
+                .unwrap()
+                .purchase,
+            99
+        );
+        assert_eq!(std::mem::size_of::<EventCopy<u32>>(), 24);
+    }
+
+    #[test]
+    fn identical_worker_offsets_and_hashes_do_not_equate_different_ids() {
+        let keys = EventKeyLayout::new(0, 128, true);
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        let hash = 10u64 << LANES.trailing_zeros();
+        let first_key = keys.long_key(&[], 0, b"long identifier one", hash, &mut first);
+        let second_key = keys.long_key(&[], 0, b"long identifier two", hash, &mut second);
+        assert_eq!(first_key, second_key);
+        assert!(!keys.same_id(first_key, second_key, &[], &first, &second));
+        let copy = keys.long_key(&[], 0, b"long identifier one", hash, &mut second);
+        assert!(keys.same_id(first_key, copy, &[], &first, &second));
     }
 }

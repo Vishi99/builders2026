@@ -12,6 +12,7 @@ serde_json = "=1.0.145"
 avx512-intrinsics = []
 split-cuts = []
 shared-worker-budget = []
+short-clicks = []
 
 [profile.release]
 lto = "fat"

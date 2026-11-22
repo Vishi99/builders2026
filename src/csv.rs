@@ -5,7 +5,8 @@ use std::io;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::slice;
 use std::sync::OnceLock;
@@ -15,6 +16,7 @@ enum EventScanner {
     Scalar,
     Avx2,
     Avx512,
+    Tokens,
 }
 
 static EVENT_SCANNER: OnceLock<EventScanner> = OnceLock::new();
@@ -37,8 +39,11 @@ pub fn configure_event_scanner() -> io::Result<()> {
     let scanner = match mode.as_str() {
         "auto" if avx512 => EventScanner::Avx512,
         "auto" | "avx2" if avx2 => EventScanner::Avx2,
+        #[cfg(target_arch = "aarch64")]
+        "auto" => EventScanner::Tokens,
         "auto" | "scalar" => EventScanner::Scalar,
         "avx512" if avx512 => EventScanner::Avx512,
+        "tokens" => EventScanner::Tokens,
         _ => {
             return Err(io::Error::other(format!(
                 "unsupported event scanner: {mode}"
@@ -66,6 +71,7 @@ unsafe extern "C" {
 pub struct Mapped {
     ptr: NonNull<u8>,
     len: usize,
+    path: PathBuf,
 }
 
 // The mappings are read-only and live until all borrowed ranges are dropped.
@@ -83,6 +89,7 @@ impl Mapped {
             return Ok(Self {
                 ptr: NonNull::dangling(),
                 len,
+                path: path.to_owned(),
             });
         }
 
@@ -105,7 +112,11 @@ impl Mapped {
             unsafe { munmap(addr, len) };
             return Err(io::Error::other("file was mapped at address zero"));
         };
-        Ok(Self { ptr, len })
+        Ok(Self {
+            ptr,
+            len,
+            path: path.to_owned(),
+        })
     }
 }
 
@@ -156,9 +167,39 @@ pub fn after_header(bytes: &[u8]) -> &[u8] {
 
 /// Workers receive disjoint slices aligned to complete physical rows.
 pub fn chunks(inputs: &[Mapped], target_size: usize) -> Vec<&[u8]> {
+    input_chunks(inputs, target_size)
+        .into_iter()
+        .map(InputChunk::mapped)
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+pub struct InputChunk<'a> {
+    file: &'a Mapped,
+    start: usize,
+    len: usize,
+}
+
+impl<'a> InputChunk<'a> {
+    pub fn mapped(self) -> &'a [u8] {
+        &self.file[self.start..self.start + self.len]
+    }
+
+    pub fn read_into(self, buffer: &mut Vec<u8>) -> io::Result<&[u8]> {
+        if buffer.len() < self.len {
+            buffer.resize(self.len, 0);
+        }
+        let bytes = &mut buffer[..self.len];
+        File::open(&self.file.path)?.read_exact_at(bytes, self.start as u64)?;
+        Ok(bytes)
+    }
+}
+
+pub fn input_chunks(inputs: &[Mapped], target_size: usize) -> Vec<InputChunk<'_>> {
     let mut ranges = Vec::new();
     for file in inputs {
         let mut remaining = after_header(file);
+        let mut start = file.len() - remaining.len();
         while !remaining.is_empty() {
             let stop = target_size.max(1).min(remaining.len());
             let end = if stop == remaining.len() || remaining[stop - 1] == b'\n' {
@@ -166,14 +207,60 @@ pub fn chunks(inputs: &[Mapped], target_size: usize) -> Vec<&[u8]> {
             } else {
                 find(&remaining[stop..], b'\n').map_or(remaining.len(), |n| stop + n + 1)
             };
-            let (task, rest) = remaining.split_at(end);
-            ranges.push(task);
-            remaining = rest;
+            ranges.push(InputChunk {
+                file,
+                start,
+                len: end,
+            });
+            remaining = &remaining[end..];
+            start += end;
         }
     }
     // Give any large task a chance to start before the tail of small shards.
-    ranges.sort_unstable_by_key(|range| std::cmp::Reverse(range.len()));
+    ranges.sort_unstable_by_key(|range| std::cmp::Reverse(range.len));
     ranges
+}
+
+#[cfg(all(any(target_arch = "x86_64", test), feature = "short-clicks"))]
+#[inline(always)]
+fn short_fields<const N: usize>(row: &[u8], mut commas: u64, quotes: u64) -> Option<[&[u8]; N]> {
+    if row.is_empty() {
+        return None;
+    }
+    let inside = (1u64 << row.len()) - 1;
+    commas &= inside;
+    let quotes = quotes & inside;
+    if commas.count_ones() as usize + 1 != N {
+        return None;
+    }
+    let mut fields = [&[] as &[u8]; N];
+    let mut start = 0;
+    let mut quoted = 0;
+    for (i, field) in fields.iter_mut().enumerate() {
+        let end = if i + 1 == N {
+            row.len()
+        } else {
+            commas.trailing_zeros() as usize
+        };
+        let skip = if start < end && quotes != 0 {
+            let open = (quotes >> start) & 1;
+            let close = (quotes >> (end - 1)) & 1;
+            if open != close || (open == 1 && end - start < 2) {
+                return None;
+            }
+            quoted += open as u32;
+            open as usize
+        } else {
+            0
+        };
+        // Exact delimiter count bounds the slices. Two separate quote
+        // positions were required before trimming a quoted field.
+        *field = unsafe { row.get_unchecked(start + skip..end - skip) };
+        commas &= commas.wrapping_sub(1);
+        start = end + 1;
+    }
+    // Reject any unpaired or interior quote that the field edges didn't use.
+    (quotes.count_ones() == 2 * quoted).then_some(fields)
 }
 
 /// Census the first field. The caller uses it for a conservative filter, so
@@ -272,6 +359,134 @@ fn scalar_rows<'a, const N: usize>(bytes: &'a [u8], mut visit: impl FnMut([&'a [
         }
         start = newline + 1;
     }
+}
+
+/// Visit commas, line feeds and quotes once in physical byte order. A
+/// quoted field is valid exactly when its two quotes are at its edges.
+fn token_rows<'a, const N: usize>(bytes: &'a [u8], mut visit: impl FnMut([&'a [u8]; N])) {
+    let mut fields = [&[] as &[u8]; N];
+    let mut start = 0;
+    let mut index = 0;
+    let mut quotes = 0;
+    let mut valid = true;
+    let mut token = |at: usize, byte: u8| {
+        if byte == b'"' {
+            quotes += 1;
+            return;
+        }
+        if valid && index < N {
+            let field = &bytes[start..at];
+            match quotes {
+                0 => fields[index] = field,
+                2 if field.len() >= 2 && field[0] == b'"' && field[field.len() - 1] == b'"' => {
+                    fields[index] = &field[1..field.len() - 1];
+                }
+                _ => valid = false,
+            }
+        }
+        index += 1;
+        if byte == b'\n' {
+            if valid && index == N && (N != 1 || start != at) {
+                visit(fields);
+            }
+            valid = true;
+            index = 0;
+        }
+        quotes = 0;
+        start = at + 1;
+    };
+
+    #[cfg(target_arch = "aarch64")]
+    let head = neon_tokens(bytes, &mut token);
+    #[cfg(target_arch = "x86_64")]
+    let head = if std::is_x86_feature_detected!("avx512bw") {
+        unsafe { avx512_tokens(bytes, &mut token) }
+    } else if std::is_x86_feature_detected!("avx2") {
+        unsafe { avx2_tokens(bytes, &mut token) }
+    } else {
+        0
+    };
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let head = 0;
+    for (offset, &byte) in bytes[head..].iter().enumerate() {
+        if matches!(byte, b',' | b'\n' | b'"') {
+            token(head + offset, byte);
+        }
+    }
+    if bytes.last().is_some_and(|&byte| byte != b'\n') {
+        token(bytes.len(), b'\n');
+    }
+}
+
+// The low nibbles of comma, LF and double quote are distinct. Unused
+// entries contain bytes whose low nibbles differ from their positions.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const TOKEN_LOOKUP: [u8; 16] = [
+    255, 255, b'"', 255, 255, 255, 255, 255, 255, 255, b'\n', 255, b',', 255, 255, 0,
+];
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn avx512_tokens(bytes: &[u8], token: &mut impl FnMut(usize, u8)) -> usize {
+    use std::arch::x86_64::*;
+    unsafe {
+        let table = _mm512_broadcast_i32x4(_mm_loadu_si128(TOKEN_LOOKUP.as_ptr().cast()));
+        let nibble = _mm512_set1_epi8(15);
+        for (block, input) in bytes.chunks_exact(64).enumerate() {
+            let data = _mm512_loadu_si512(input.as_ptr().cast());
+            let lookup = _mm512_shuffle_epi8(table, _mm512_and_si512(data, nibble));
+            let mut bits = _mm512_cmpeq_epi8_mask(data, lookup);
+            while bits != 0 {
+                let offset = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                token(block * 64 + offset, *input.get_unchecked(offset));
+            }
+        }
+    }
+    bytes.len() & !63
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_tokens(bytes: &[u8], token: &mut impl FnMut(usize, u8)) -> usize {
+    use std::arch::x86_64::*;
+    unsafe {
+        let table = _mm256_broadcastsi128_si256(_mm_loadu_si128(TOKEN_LOOKUP.as_ptr().cast()));
+        let nibble = _mm256_set1_epi8(15);
+        for (block, input) in bytes.chunks_exact(32).enumerate() {
+            let data = _mm256_loadu_si256(input.as_ptr().cast());
+            let lookup = _mm256_shuffle_epi8(table, _mm256_and_si256(data, nibble));
+            let mut bits = _mm256_movemask_epi8(_mm256_cmpeq_epi8(data, lookup)) as u32;
+            while bits != 0 {
+                let offset = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                token(block * 32 + offset, *input.get_unchecked(offset));
+            }
+        }
+    }
+    bytes.len() & !31
+}
+
+#[cfg(target_arch = "aarch64")]
+fn neon_tokens(bytes: &[u8], token: &mut impl FnMut(usize, u8)) -> usize {
+    use std::arch::aarch64::*;
+    unsafe {
+        let lookup = vld1q_u8(TOKEN_LOOKUP.as_ptr());
+        let low = vdupq_n_u8(15);
+        for (block, input) in bytes.chunks_exact(16).enumerate() {
+            let span = vld1q_u8(input.as_ptr());
+            let found = vceqq_u8(vqtbl1q_u8(lookup, vandq_u8(span, low)), span);
+            let mut bits = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(
+                vreinterpretq_u16_u8(found),
+            ))) & 0x1111_1111_1111_1111;
+            while bits != 0 {
+                let offset = bits.trailing_zeros() as usize / 4;
+                bits &= bits - 1;
+                token(block * 16 + offset, *input.get_unchecked(offset));
+            }
+        }
+    }
+    bytes.len() & !15
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -390,12 +605,25 @@ fn vector_rows<'a, const N: usize>(
     classify: impl Fn(*const u8) -> Block,
 ) {
     let mut pos = 0;
-    while bytes.len() - pos >= 128 {
+    let short_clicks = cfg!(feature = "short-clicks") && N == 4;
+    let min_bytes = if short_clicks { 64 } else { 128 };
+    while bytes.len() - pos >= min_bytes {
         let first = classify(unsafe { bytes.as_ptr().add(pos) });
         let n0 = first.newline.trailing_zeros() as usize;
+        #[cfg(feature = "short-clicks")]
+        if short_clicks && n0 < 64 {
+            if let Some(fields) = short_fields(&bytes[pos..pos + n0], first.comma, first.quote) {
+                visit(fields);
+            }
+            pos += n0 + 1;
+            continue;
+        }
         let (length, commas, quotes) = if n0 < 64 {
             (n0, first.comma as u128, first.quote as u128)
         } else {
+            if short_clicks && bytes.len() - pos < 128 {
+                break;
+            }
             let next = classify(unsafe { bytes.as_ptr().add(pos + 64) });
             let n1 = next.newline.trailing_zeros() as usize;
             if n1 >= 64 {
@@ -434,6 +662,9 @@ unsafe fn avx2_rows<'a, const N: usize>(bytes: &'a [u8], visit: impl FnMut([&'a 
 
 /// Decode whole fields from each structurally valid row. No data is copied.
 pub fn rows<'a, const N: usize>(bytes: &'a [u8], visit: impl FnMut([&'a [u8]; N])) {
+    if N == 4 && matches!(EVENT_SCANNER.get(), Some(EventScanner::Tokens)) {
+        return token_rows(bytes, visit);
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx512bw") {
@@ -907,9 +1138,13 @@ unsafe fn intrinsic_event_rows<'a>(bytes: &'a [u8], visit: impl FnMut(EventRow<'
 }
 
 pub fn event_rows<'a>(bytes: &'a [u8], mut visit: impl FnMut(EventRow<'a, '_>)) {
+    let scanner = EVENT_SCANNER.get().copied().unwrap_or(EventScanner::Scalar);
+    if matches!(scanner, EventScanner::Tokens) {
+        return token_rows(bytes, |fields| visit(EventRow(EventFields::Wide(&fields))));
+    }
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
-        match EVENT_SCANNER.get().copied().unwrap_or(EventScanner::Scalar) {
+        match scanner {
             EventScanner::Avx512 => {
                 #[cfg(feature = "avx512-intrinsics")]
                 return unsafe { intrinsic_event_rows(bytes, visit) };
@@ -917,8 +1152,58 @@ pub fn event_rows<'a>(bytes: &'a [u8], mut visit: impl FnMut(EventRow<'a, '_>)) 
                 return vector_event_rows(bytes, visit, avx512_block);
             }
             EventScanner::Avx2 => return unsafe { avx2_event_rows(bytes, visit) },
-            EventScanner::Scalar => {}
+            EventScanner::Scalar | EventScanner::Tokens => {}
         }
     }
     scalar_rows(bytes, |fields| visit(EventRow(EventFields::Wide(&fields))));
+}
+
+#[cfg(test)]
+#[test]
+fn token_scanner_matches_scalar_across_simd_boundaries() {
+    for padding in 0..64 {
+        let mut input = vec![b'x'; padding];
+        input.extend_from_slice(b",b,c,d\n");
+        input.extend_from_slice(
+            b"\"id\",a,,b\n\n\"\",a,\"c\",d\r\n\"a\"b,b,c,d\na,b\"q,c,d\na,b,c,d,e\na,\"b,c,d\na,b,c\n",
+        );
+        // Include mixed UTF-8, a quoted field spanning several SIMD blocks,
+        // and a valid final physical row without a line feed.
+        input.push(b'"');
+        input.extend(std::iter::repeat_n(b'a', 195));
+        input.extend_from_slice("\",élan,\"\" ,x\nβ,b,\"\",\"last\"".as_bytes());
+        let mut scalar = Vec::new();
+        let mut simd = Vec::new();
+        scalar_rows::<4>(&input, |fields| scalar.push(fields));
+        token_rows::<4>(&input, |fields| simd.push(fields));
+        assert_eq!(simd, scalar);
+    }
+}
+
+#[cfg(all(test, feature = "short-clicks"))]
+mod short_fields_tests {
+    use super::*;
+
+    #[test]
+    fn checks_exactly_the_same_quote_pairs_as_scalar_csv() {
+        let spellings: [&[u8]; 8] = [b"", b"a", b"\"\"", b"\"a\"", b"\"", b"a\"", b"\"a", b"a\"b"];
+        for first in spellings {
+            for second in spellings {
+                for third in spellings {
+                    for last in spellings {
+                        let row = [first, second, third, last].join(&b',');
+                        let mask = |needle| {
+                            row.iter().enumerate().fold(1u64 << 63, |bits, (i, &byte)| {
+                                bits | (u64::from(byte == needle) << i)
+                            })
+                        };
+                        assert_eq!(
+                            short_fields::<4>(&row, mask(b','), mask(b'"')),
+                            scalar_fields::<4>(&row)
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
