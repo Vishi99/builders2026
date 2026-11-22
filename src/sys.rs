@@ -18,6 +18,19 @@ const MAP_PRIVATE: i32 = 2;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_NORESERVE: i32 = 0x4000;
 const MADV_HUGEPAGE: i32 = 14;
+const MADV_DONTNEED: i32 = 4;
+
+/// Drop page-table entries of a read-only file mapping range (the pages stay
+/// in the page cache). Lets workers share the teardown instead of exit.
+pub fn release_range(ptr: *const u8, len: usize) {
+    let start = (ptr as usize + 4095) & !4095;
+    let end = (ptr as usize + len) & !4095;
+    if end > start {
+        unsafe {
+            madvise(start as *mut c_void, end - start, MADV_DONTNEED);
+        }
+    }
+}
 
 /// A read-only mapping of a whole file. Bytes past the end of the file up to
 /// the end of its last page read as zero.

@@ -69,6 +69,9 @@ pub struct Out {
     starts: Vec<u32>,
     sdays: Vec<u32>,
     srev: Vec<u64>,
+    cnt: Vec<u32>,
+    pos: Vec<u32>,
+    active: Vec<u32>,
 }
 
 impl Out {
@@ -88,6 +91,9 @@ impl Out {
             starts: Vec::new(),
             sdays: Vec::new(),
             srev: Vec::new(),
+            cnt: vec![0; ncamp],
+            pos: vec![0; ncamp],
+            active: Vec::new(),
         }
     }
 
@@ -298,18 +304,40 @@ impl Out {
 
     /// Credit and assists for the sessions in `starts`.
     fn attribute(&mut self, clicks: &[Click]) {
-        let ndays = self.ndays;
+        let ncamp = self.ncamp;
+        let heavy = clicks.len() > 2048 || unsafe { HEAVY };
+        let sliding = !heavy && !unsafe { NOASSIST };
         let (mut lo, mut hi) = (0usize, 0usize);
-        let mut window_total = 0usize;
         for k in 0..self.starts.len() {
             let start = self.starts[k];
             let day = self.sdays[k] as usize;
             let rev = self.srev[k];
             let sc = start + WEEK;
             while hi < clicks.len() && clicks[hi].ts <= sc {
+                if sliding {
+                    let c = clicks[hi].camp as usize;
+                    let n = unsafe { self.cnt.get_unchecked_mut(c) };
+                    if *n == 0 {
+                        self.pos[c] = self.active.len() as u32;
+                        self.active.push(c as u32);
+                    }
+                    *n += 1;
+                }
                 hi += 1;
             }
             while lo < hi && clicks[lo].ts < start {
+                if sliding {
+                    let c = clicks[lo].camp as usize;
+                    let n = unsafe { self.cnt.get_unchecked_mut(c) };
+                    *n -= 1;
+                    if *n == 0 {
+                        let at = self.pos[c] as usize;
+                        let last = *self.active.last().unwrap();
+                        self.active[at] = last;
+                        self.pos[last as usize] = at as u32;
+                        self.active.pop();
+                    }
+                }
                 lo += 1;
             }
             let camp = if hi > lo {
@@ -322,44 +350,23 @@ impl Out {
             } else {
                 0
             };
-            window_total += hi - lo;
-            let st = &mut self.cred[day * self.ncamp + camp];
+            let st = &mut self.cred[day * ncamp + camp];
             st.sessions += 1;
             st.revenue += rev;
             st.purchasing += (rev > 0) as u32;
-        }
-        if window_total == 0 || unsafe { NOASSIST } {
-            return;
-        }
-        if window_total <= 4 * clicks.len() + 64 && !unsafe { HEAVY } {
-            let (mut lo, mut hi) = (0usize, 0usize);
-            for k in 0..self.starts.len() {
-                let start = self.starts[k];
-                let day = self.sdays[k] as usize;
-                let sc = start + WEEK;
-                while hi < clicks.len() && clicks[hi].ts <= sc {
-                    hi += 1;
-                }
-                while lo < hi && clicks[lo].ts < start {
-                    lo += 1;
-                }
-                if hi > lo {
-                    self.sid = self.sid.wrapping_add(1);
-                    if self.sid == 0 {
-                        self.stamp.fill(0);
-                        self.sid = 1;
-                    }
-                    let sid = self.sid;
-                    for c in &clicks[lo..hi] {
-                        let kk = c.camp as usize;
-                        if self.stamp[kk] != sid {
-                            self.stamp[kk] = sid;
-                            self.assist[day * self.ncamp + kk] += 1;
-                        }
-                    }
+            if sliding {
+                let row = &mut self.assist[day * ncamp..(day + 1) * ncamp];
+                for &c in &self.active {
+                    unsafe { *row.get_unchecked_mut(c as usize) += 1 };
                 }
             }
-        } else {
+        }
+        if sliding {
+            for &c in &self.active {
+                self.cnt[c as usize] = 0;
+            }
+            self.active.clear();
+        } else if heavy && !unsafe { NOASSIST } && !clicks.is_empty() {
             self.assists_heavy(clicks);
         }
     }
@@ -499,8 +506,19 @@ pub fn sort_clicks_slice(c: &mut [Click], longs: &LongTable) -> usize {
     } else {
         c.sort_unstable_by(|a, b| (a.ts, a.ckey).cmp(&(b.ts, b.ckey)));
     }
-    if !longs.is_empty() && c.iter().any(|x| x.ckey & crate::ids::LONG != 0) {
-        c.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| longs.cmp(a.ckey, b.ckey)));
+    if !longs.is_empty() {
+        // Re-order only equal-ts runs that contain a long ID.
+        let mut i = 0;
+        while i < c.len() {
+            let mut j = i + 1;
+            while j < c.len() && c[j].ts == c[i].ts {
+                j += 1;
+            }
+            if j - i > 1 && c[i..j].iter().any(|x| x.ckey & crate::ids::LONG != 0) {
+                c[i..j].sort_by(|a, b| longs.cmp(a.ckey, b.ckey));
+            }
+            i = j;
+        }
     }
     let mut w = 1;
     for r in 1..c.len() {

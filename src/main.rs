@@ -11,7 +11,7 @@ mod text;
 mod ts;
 
 use dims::Dims;
-use ids::{id_key, user_key, LongIds, LongTable};
+use ids::{event_key, id_key, user_key, LongIds, LongTable};
 use links::{Forest, KRec, KeyPart, EREF_SHIFT};
 use sess::{Click, Out, URow, DAY, WEEK};
 use std::path::{Path, PathBuf};
@@ -92,6 +92,18 @@ struct Chunk {
     ptr: *const u8,
     len: usize,
     _tail: Option<Box<[u8]>>,
+    /// Whether the start / end is a nominal offset to move to a row start.
+    lazy: (bool, bool),
+}
+
+/// First row start at or after `p`: `p` itself when the byte before is a
+/// newline, else just past the next newline.
+unsafe fn row_start(p: *const u8) -> *const u8 {
+    let mut q = p.sub(1);
+    while *q != b'\n' {
+        q = q.add(1);
+    }
+    q.add(1)
 }
 unsafe impl Send for Chunk {}
 unsafe impl Sync for Chunk {}
@@ -136,16 +148,12 @@ fn chunk_file(kind: Kind, m: &Mapped, target: usize, out: &mut Vec<Chunk>) {
             None => header_end,
         }
     };
+    // Nominal boundaries; the worker moves each one to the next row start
+    // (both neighbours apply the same rule), so no page is touched here.
     let mut start = header_end;
     while start < tail_start {
-        let mut end = (start + target).min(tail_start);
-        if end < tail_start {
-            match b[end..tail_start].iter().position(|&c| c == b'\n') {
-                Some(i) => end += i + 1,
-                None => end = tail_start,
-            }
-        }
-        out.push(Chunk { kind, ptr: unsafe { m.ptr.add(start) }, len: end - start, _tail: None });
+        let end = (start + target).min(tail_start);
+        out.push(Chunk { kind, ptr: unsafe { m.ptr.add(start) }, len: end - start, _tail: None, lazy: (start != header_end, end != tail_start) });
         start = end;
     }
     if tail_start < len {
@@ -156,7 +164,7 @@ fn chunk_file(kind: Kind, m: &Mapped, target: usize, out: &mut Vec<Chunk>) {
         let n = t.len();
         t.resize(n + PAD, 0);
         let t = t.into_boxed_slice();
-        out.push(Chunk { kind, ptr: t.as_ptr(), len: n, _tail: Some(t) });
+        out.push(Chunk { kind, ptr: t.as_ptr(), len: n, _tail: Some(t), lazy: (false, false) });
     }
 }
 
@@ -209,6 +217,10 @@ struct Shared {
     longtab: Racy<Option<LongTable>>,
     counters: Vec<AtomicUsize>,
     barrier: Barrier,
+    lbar: Barrier,
+    nlink: usize,
+    bits_long: u32,
+    ranges: Vec<(usize, usize)>,
     exotic: AtomicBool,
     times: Racy<Vec<(&'static str, f64)>>,
     t0: std::time::Instant,
@@ -304,7 +316,7 @@ unsafe fn parse_events(sh: &Shared, lo: &mut Local, base: *const u8, len: usize)
         if l0 == 0 {
             return;
         }
-        let ekey = id_key(fp(0), l0, longs);
+        let ekey = event_key(fp(0), l0, longs);
         let (p3, l3) = (fp(3), fl(3));
         let ing = if l3 == 20 { ts::parse_f12_simd(p3, 20, clock) } else { ts::parse_ts(p3, l3, clock) };
         let ing = match ing {
@@ -434,10 +446,16 @@ fn phase_parse(sh: &Shared, tid: usize) {
         let c = &sh.chunks[i];
         let lo = sh.local(tid);
         unsafe {
+            let a = if c.lazy.0 { row_start(c.ptr) } else { c.ptr };
+            let b = if c.lazy.1 { row_start(c.ptr.add(c.len)) } else { c.ptr.add(c.len) };
+            if b <= a {
+                continue;
+            }
+            let (p, n) = (a, b as usize - a as usize);
             match c.kind {
-                Kind::Events => parse_events(sh, lo, c.ptr, c.len),
-                Kind::Clicks => parse_clicks(sh, lo, c.ptr, c.len),
-                Kind::Links => parse_links(sh, tid, lo, c.ptr, c.len),
+                Kind::Events => parse_events(sh, lo, p, n),
+                Kind::Clicks => parse_clicks(sh, lo, p, n),
+                Kind::Links => parse_links(sh, tid, lo, p, n),
             }
         }
     }
@@ -457,18 +475,29 @@ fn phase_parse(sh: &Shared, tid: usize) {
 /// pipeline).
 fn phase_longs(sh: &Shared, tid: usize) {
     let nt = sh.nt;
-    let nd = 1usize << ids::LBITS;
+    let nd = 1usize << sh.bits_long;
     if tid == 0 {
         let any = (0..nt).any(|t| sh.local(t).longs.parts.iter().any(|v| v.count != 0));
         let parts = (0..nd).map(|_| ids::LongPart::default()).collect();
-        unsafe { *sh.longtab.get() = Some(LongTable { parts, bits: ids::LBITS, any }) };
+        unsafe { *sh.longtab.get() = Some(LongTable { parts, bits: sh.bits_long, any }) };
     }
-    sh.barrier.wait();
+    sh.lbar.wait();
     let tab = unsafe { sh.longtab.get().as_mut().unwrap() } as *mut LongTable;
+    let mut scratch = Vec::new();
+    let mut gens = Vec::new();
+    let mut gen = 0u32;
     loop {
         let p = sh.claim(8);
-        if p >= nd {
+        if p >= 2 * nd {
             break;
+        }
+        if p >= nd {
+            let recs: Vec<&Stream> = (0..nt).map(|t| &sh.local(t).longs.evparts[p - nd]).collect();
+            gen += 1;
+            if !ids::check_events(&recs, &mut scratch, &mut gens, gen) {
+                sh.exotic.store(true, Ordering::Relaxed);
+            }
+            continue;
         }
         let recs: Vec<&Stream> = (0..nt).map(|t| &sh.local(t).longs.parts[p]).collect();
         let (lp, ok) = ids::LongPart::build(&recs);
@@ -496,10 +525,7 @@ fn phase_links(sh: &Shared, tid: usize) -> bool {
         let kp = KeyPart::build(&mut keys.into_iter(), n);
         unsafe { *sh.keyparts[p].get() = kp };
     }
-    sh.barrier.wait();
-    if sh.exotic.load(Ordering::Relaxed) {
-        return false;
-    }
+    sh.lbar.wait();
     if tid == 0 {
         let mut base = 0u32;
         for p in 0..nl {
@@ -509,7 +535,7 @@ fn phase_links(sh: &Shared, tid: usize) -> bool {
         }
         unsafe { *sh.forest.get() = Some(Forest::new(base as usize)) };
     }
-    sh.barrier.wait();
+    sh.lbar.wait();
     loop {
         let p = sh.claim(2);
         if p >= nl {
@@ -530,16 +556,16 @@ fn phase_links(sh: &Shared, tid: usize) -> bool {
             });
         }
     }
-    sh.barrier.wait();
+    sh.lbar.wait();
     sh.lap(tid, "l-ends");
     let forest = unsafe { sh.forest.get().as_ref().unwrap() };
-    {
-        let ends = &sh.local(tid).ends;
+    for t in (tid..nt).step_by(sh.nlink) {
+        let ends = &sh.local(t).ends;
         for e in ends.chunks_exact(2) {
             forest.union(e[0], e[1]);
         }
     }
-    sh.barrier.wait();
+    sh.lbar.wait();
     loop {
         let p = sh.claim(3);
         if p >= nl {
@@ -555,7 +581,7 @@ fn phase_links(sh: &Shared, tid: usize) -> bool {
             }
         }
     }
-    sh.barrier.wait();
+    sh.lbar.wait();
     sh.lap(tid, "l-min");
     {
         // Long keys compete by bytes; a CAS loop keeps the smallest.
@@ -571,7 +597,7 @@ fn phase_links(sh: &Shared, tid: usize) -> bool {
             }
         }
     }
-    sh.barrier.wait();
+    sh.lbar.wait();
     sh.lap(tid, "l-longmin");
     loop {
         let p = sh.claim(4);
@@ -722,6 +748,22 @@ fn phase_dedup(sh: &Shared, tid: usize) {
 /// Map users to persons. Records whose person partition is this partition
 /// stay in place with the person key written in; others move.
 fn phase_route(sh: &Shared, tid: usize) {
+    // Input bytes are no longer needed (long IDs own their bytes): drop this
+    // worker's share of the mapping's page-table entries in parallel.
+    {
+        const PIECE: usize = 64 << 20;
+        let mut k = 0usize;
+        for &(p, l) in &sh.ranges {
+            let mut off = 0;
+            while off < l {
+                if k % sh.nt == tid {
+                    sys::release_range((p + off) as *const u8, PIECE.min(l - off));
+                }
+                k += 1;
+                off += PIECE;
+            }
+        }
+    }
     let nt = sh.nt;
     let nu = 1usize << sh.bits_u;
     let bits_u = sh.bits_u;
@@ -823,7 +865,21 @@ fn radix_pass(src: &[u64], dst: &mut [u64], shift: u32) {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct CSlot {
+    pkey: u64,
+    min: u32,
+    max: u32,
+    count: u32,
+    phead: u32,
+    /// bucket (low 11 bits) | generation << 11
+    tag: u32,
+    _pad: u32,
+}
+
 struct EScratch {
+    occ: Vec<u32>,
     keys: Vec<u64>,
     tmp: Vec<u64>,
     slots: Vec<u32>,
@@ -886,6 +942,7 @@ fn phase_sessions(sh: &Shared, tid: usize) {
     let out = sh.local(tid).out.as_mut().unwrap() as *mut Out;
     let out = unsafe { &mut *out };
     let mut x = EScratch {
+        occ: Vec::new(),
         keys: Vec::new(),
         tmp: Vec::new(),
         slots: Vec::new(),
@@ -903,6 +960,8 @@ fn phase_sessions(sh: &Shared, tid: usize) {
     let verbose = std::env::var("SS_TIMING").is_ok();
     let mut tm = [0f64; 6];
     let tstart = sys::now();
+    let mut ctab: Vec<CSlot> = Vec::new();
+    let mut cgen = 0u32;
     loop {
         let i = sh.claim(7);
         if i >= nu {
@@ -914,62 +973,81 @@ fn phase_sessions(sh: &Shared, tid: usize) {
         if n == 0 {
             continue;
         }
-        // Cells keyed by (person key, bucket).
-        let cbits = ((n + n / 2).max(16)).next_power_of_two().trailing_zeros();
+        // Cells keyed by (person key, bucket): generation-tagged slots.
+        let cbits = ((n / 2).max(16)).next_power_of_two().trailing_zeros() + 1;
         let ccap = 1usize << cbits;
-        x.cslot.clear();
-        x.cslot.resize(ccap, 0);
-        x.cells.clear();
-        x.cpkey.clear();
-        x.cbucket.clear();
+        if ctab.len() < ccap || cgen >= (1 << 20) - 1 {
+            ctab = vec![CSlot::default(); ccap.max(ctab.len())];
+            cgen = 0;
+        }
+        cgen += 1;
+        let gtag = cgen << 11;
+        x.occ.clear();
         x.purch.clear();
-        for t in 0..nt {
-            for s in [&sh.local(t).win[q], &sh.local(t).per[q]] {
-                s.for_each_block::<WinRec>(|b| {
-                    for r in b {
-                        if r.ts == DEAD {
-                            continue;
-                        }
-                        let bucket = r.ts / BUCKET;
-                        let mut h = part(r.key ^ (bucket as u64).wrapping_mul(0x9E37_79B9), MUL_G, cbits);
-                        let ci = loop {
-                            let c = unsafe { *x.cslot.get_unchecked(h) };
-                            if c == 0 {
-                                x.cells.push(sess::Cell { min: r.ts, max: r.ts, count: 0, phead: 0 });
-                                x.cpkey.push(r.key);
-                                x.cbucket.push(bucket);
-                                unsafe { *x.cslot.get_unchecked_mut(h) = x.cells.len() as u32 };
-                                break x.cells.len() - 1;
-                            }
-                            let ci = (c - 1) as usize;
-                            if unsafe { *x.cpkey.get_unchecked(ci) == r.key && *x.cbucket.get_unchecked(ci) == bucket } {
-                                break ci;
-                            }
-                            h = (h + 1) & (ccap - 1);
-                        };
-                        let cell = unsafe { x.cells.get_unchecked_mut(ci) };
-                        cell.min = cell.min.min(r.ts);
-                        cell.max = cell.max.max(r.ts);
-                        cell.count += 1;
+        {
+            let ctab_p = ctab.as_mut_ptr();
+            let occ = &mut x.occ;
+            let purch = &mut x.purch;
+            let mut visit = |r: &WinRec| {
+                let bucket = r.ts / BUCKET;
+                let tb = bucket | gtag;
+                let mut h = part(r.key ^ (bucket as u64).wrapping_mul(0x9E37_79B9), MUL_G, cbits);
+                loop {
+                    let c = unsafe { &mut *ctab_p.add(h) };
+                    if c.tag >> 11 != cgen {
+                        *c = CSlot { pkey: r.key, min: r.ts, max: r.ts, count: 1, phead: 0, tag: tb, _pad: 0 };
+                        occ.push(h as u32);
                         if r.pinfo != 0 {
-                            x.purch.push((cell.phead, r.pinfo));
-                            cell.phead = x.purch.len() as u32;
+                            purch.push((0, r.pinfo));
+                            c.phead = purch.len() as u32;
                         }
+                        break;
                     }
-                });
+                    if c.pkey == r.key && c.tag == tb {
+                        c.min = c.min.min(r.ts);
+                        c.max = c.max.max(r.ts);
+                        c.count += 1;
+                        if r.pinfo != 0 {
+                            purch.push((c.phead, r.pinfo));
+                            c.phead = purch.len() as u32;
+                        }
+                        break;
+                    }
+                    h = (h + 1) & (ccap - 1);
+                }
+            };
+            for t in 0..nt {
+                for s in [&sh.local(t).win[q], &sh.local(t).per[q]] {
+                    s.for_each_block::<WinRec>(|b| {
+                        const AHEAD: usize = 8;
+                        for (j, r) in b.iter().enumerate() {
+                            if let Some(f) = b.get(j + AHEAD) {
+                                let fb = f.ts / BUCKET;
+                                let fh = part(f.key ^ (fb as u64).wrapping_mul(0x9E37_79B9), MUL_G, cbits);
+                                unsafe {
+                                    std::arch::x86_64::_mm_prefetch(ctab_p.add(fh) as *const i8, std::arch::x86_64::_MM_HINT_T0)
+                                };
+                            }
+                            if r.ts != DEAD {
+                                visit(r);
+                            }
+                        }
+                    });
+                }
             }
         }
         let tb = sys::now();
         // Person ids for cells, then sort cells by (gid, bucket).
-        let nc = x.cells.len();
+        let nc = x.occ.len();
         let gbits = ((nc * 2).max(16)).next_power_of_two().trailing_zeros();
         x.slots.clear();
         x.slots.resize(1 << gbits, 0);
         x.gkeys.clear();
         x.keys.clear();
-        for ci in 0..nc {
-            let g = gid_insert(x.cpkey[ci], gbits, &mut x.slots, &mut x.gkeys) as u64;
-            x.keys.push((g << 43) | ((x.cbucket[ci] as u64) << 32) | ci as u64);
+        for &h in x.occ.iter() {
+            let c = &ctab[h as usize];
+            let g = gid_insert(c.pkey, gbits, &mut x.slots, &mut x.gkeys) as u64;
+            x.keys.push((g << 43) | (((c.tag & 2047) as u64) << 32) | h as u64);
         }
         let ng = x.gkeys.len();
         let gb = (64 - ((ng as u64).max(2) - 1).leading_zeros()).max(1);
@@ -991,7 +1069,10 @@ fn phase_sessions(sh: &Shared, tid: usize) {
             std::mem::swap(&mut x.keys, &mut x.tmp);
         }
         x.sorted.clear();
-        x.sorted.extend(x.keys.iter().map(|&k| x.cells[(k & 0xffff_ffff) as usize]));
+        x.sorted.extend(x.keys.iter().map(|&k| {
+            let c = &ctab[(k & 0xffff_ffff) as usize];
+            sess::Cell { min: c.min, max: c.max, count: c.count, phead: c.phead }
+        }));
         let tc = sys::now();
         // Clicks grouped by gid (persons without events dropped).
         x.clicks.clear();
@@ -1117,19 +1198,15 @@ fn worker(sh: &Shared, tid: usize) {
     if sh.exotic.load(Ordering::Relaxed) {
         return;
     }
-    phase_longs(sh, tid);
-    sh.barrier.wait();
-    sh.lap(tid, "longs");
-    if sh.exotic.load(Ordering::Relaxed) {
-        return;
+    // Link threads resolve long IDs and linked IDs while the others start
+    // deduplicating; link threads then join the dedup work.
+    if tid < sh.nlink {
+        phase_longs(sh, tid);
+        sh.lbar.wait();
+        sh.lap(tid, "longs");
+        phase_links(sh, tid);
+        sh.lap(tid, "links");
     }
-    if !phase_links(sh, tid) {
-        return;
-    }
-    sh.barrier.wait();
-    sh.lap(tid, "links");
-    stop_after(sh, tid, "links");
-    prof_from(sh, tid, "dedup");
     phase_dedup(sh, tid);
     sh.barrier.wait();
     sh.lap(tid, "dedup");
@@ -1208,8 +1285,9 @@ fn main() {
     }
 
     let (ws, we) = dims::manifest(&data).expect("manifest");
-    let dims = Dims::load(&data).expect("dimensions");
-    if dims.categories.len() > 256 || we - ws > 24 * DAY || we <= ws {
+    let dims_dir = data.clone();
+    let dims_job = std::thread::spawn(move || Dims::load(&dims_dir));
+    if we - ws > 24 * DAY || we <= ws {
         generic::run(&data, &outdir).expect("generic pipeline");
         unsafe { _exit(0) };
     }
@@ -1233,7 +1311,13 @@ fn main() {
             maps.push(m);
         }
     }
+    let dims = dims_job.join().expect("dimensions thread").expect("dimensions");
+    if dims.categories.len() > 256 {
+        generic::run(&data, &outdir).expect("generic pipeline");
+        unsafe { _exit(0) };
+    }
     let t_map = t0.elapsed().as_secs_f64();
+    let ranges: Vec<(usize, usize)> = maps.iter().filter(|m| m.len > 0).map(|m| (m.ptr as usize, m.len)).collect();
     let bits_d = bits_for(ev_bytes / 78, 9000, 4, 14);
     let bits_u = bits_for(ev_bytes / 80 + ck_bytes / 48, 12000, 4, 14);
     let bits_l = bits_for(lk_bytes / 10, 8000, 2, 12);
@@ -1244,14 +1328,15 @@ fn main() {
     let nu = 1usize << bits_u;
     // Expected long-ID sightings per thread and registry part (1 in 8 IDs
     // in generated data), with slack; vectors still grow if needed.
-    let long_per_part = ((ev_bytes / 80 + ck_bytes / 48 + lk_bytes / 20) * 2 / 8 / nt / 256) * 5 / 4 + 16;
+    let bits_long = bits_d.saturating_sub(3).max(2);
+    let _long_per_part = ((ev_bytes / 80 + ck_bytes / 48 + lk_bytes / 20) * 2 / 8 / nt / 256) * 5 / 4 + 16;
     let nl = 1usize << bits_l;
     let locals = (0..nt)
         .map(|_| {
             Racy::new(Local {
                 pool: Pool::new(64 << 20),
                 masks: text::Masks2::new(),
-                longs: LongIds::new(long_per_part),
+                longs: LongIds::new(bits_long),
                 ev: vec![Stream::new(); nd],
                 pur: vec![Stream::new(); nd],
                 clk: vec![Stream::new(); nu],
@@ -1268,6 +1353,7 @@ fn main() {
             })
         })
         .collect();
+    let nlink = std::env::var("SS_NLINK").ok().and_then(|v| v.parse().ok()).unwrap_or(if nt >= 4 { nt / 2 } else { nt }).clamp(1, nt);
     let sh = Shared {
         nt,
         chunks,
@@ -1284,6 +1370,10 @@ fn main() {
         longtab: Racy::new(None),
         counters: (0..16).map(|_| AtomicUsize::new(0)).collect(),
         barrier: Barrier::new(nt),
+        lbar: Barrier::new(nlink),
+        nlink,
+        bits_long,
+        ranges,
         exotic: AtomicBool::new(false),
         times: Racy::new(Vec::new()),
         t0,

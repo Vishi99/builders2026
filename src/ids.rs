@@ -202,6 +202,7 @@ pub struct LongRec {
 pub struct LongIds {
     cache: Vec<(u64, u64)>,
     pub parts: Vec<crate::stream::Stream>,
+    pub evparts: Vec<crate::stream::Stream>,
     pool: crate::stream::Pool,
     bits: u32,
 }
@@ -212,21 +213,22 @@ impl Default for LongIds {
     }
 }
 
-pub const LCACHE: usize = 1 << 12;
+pub const LCACHE: usize = 1 << 15;
 pub const LBITS: u32 = 8;
 
 impl LongIds {
-    pub fn new(_per_part: usize) -> LongIds {
+    pub fn new(bits: u32) -> LongIds {
         LongIds {
             cache: vec![(0, 0); LCACHE],
-            parts: vec![crate::stream::Stream::new(); 1usize << LBITS],
+            parts: vec![crate::stream::Stream::new(); 1usize << bits],
+            evparts: vec![crate::stream::Stream::new(); 1usize << bits],
             pool: crate::stream::Pool::new(16 << 20),
-            bits: LBITS,
+            bits,
         }
     }
 
     pub fn finish(&mut self) {
-        for s in self.parts.iter_mut() {
+        for s in self.parts.iter_mut().chain(self.evparts.iter_mut()) {
             s.finish();
         }
     }
@@ -238,12 +240,24 @@ impl LongIds {
         self.parts.get_unchecked_mut(part).push(&mut self.pool, rec);
     }
 
-    /// A long ID that usually occurs once (event and click IDs).
+    /// A long ID that usually occurs once and whose bytes are needed later
+    /// (click IDs).
     #[inline(never)]
     pub unsafe fn key(&mut self, p: *const u8, len: usize) -> u64 {
         let (h1, h2) = hash2(p, len);
         let k = LONG | (h1 >> 1);
         self.record(k, h2, p, len);
+        k
+    }
+
+    /// A long event ID: recorded only for the shared-key check.
+    #[inline(never)]
+    pub unsafe fn key_event(&mut self, p: *const u8, len: usize) -> u64 {
+        let (h1, h2) = hash2(p, len);
+        let k = LONG | (h1 >> 1);
+        let part = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - self.bits)) as usize;
+        let rec = LongRec { k, v: 0, h2 };
+        self.evparts.get_unchecked_mut(part).push(&mut self.pool, rec);
         k
     }
 
@@ -273,6 +287,52 @@ pub unsafe fn id_key(p: *const u8, len: usize, longs: &mut LongIds) -> u64 {
     }
 }
 
+/// The key for a non-empty event ID.
+#[inline(always)]
+pub unsafe fn event_key(p: *const u8, len: usize, longs: &mut LongIds) -> u64 {
+    let k = pack16(p, len);
+    if k != 0 {
+        k
+    } else {
+        longs.key_event(p, len)
+    }
+}
+
+/// True when no event key is shared by two spellings (by second hash).
+/// `scratch` is reused across calls; entries are (key, h2, generation).
+pub fn check_events(recs: &[&crate::stream::Stream], scratch: &mut Vec<(u64, u64)>, gens: &mut Vec<u32>, gen: u32) -> bool {
+    let n: usize = recs.iter().map(|r| r.count).sum();
+    let cap = (n * 2).max(16).next_power_of_two();
+    if scratch.len() < cap {
+        *scratch = vec![(0, 0); cap];
+        *gens = vec![0; cap];
+    }
+    let mask = cap - 1;
+    let mut ok = true;
+    for r in recs {
+        r.for_each_block::<LongRec>(|b| {
+            for &LongRec { k, h2, .. } in b {
+                let mut h = (k.wrapping_mul(0xC4CE_B9FE_1A85_EC53) >> 20) as usize & mask;
+                loop {
+                    let g = unsafe { gens.get_unchecked_mut(h) };
+                    let s = unsafe { scratch.get_unchecked_mut(h) };
+                    if *g != gen {
+                        *g = gen;
+                        *s = (k, h2);
+                        break;
+                    }
+                    if s.0 == k {
+                        ok &= s.1 == h2;
+                        break;
+                    }
+                    h = (h + 1) & mask;
+                }
+            }
+        });
+    }
+    ok
+}
+
 /// The key for a non-empty user ID.
 #[inline(always)]
 pub unsafe fn user_key(p: *const u8, len: usize, longs: &mut LongIds) -> u64 {
@@ -293,6 +353,7 @@ unsafe fn span(v: u64) -> &'static [u8] {
 #[derive(Default)]
 pub struct LongPart {
     slots: Vec<(u64, u64)>,
+    bytes: Vec<u8>,
 }
 
 impl LongPart {
@@ -329,7 +390,18 @@ impl LongPart {
                 }
             });
         }
-        (LongPart { slots }, ok)
+        // Own the bytes so the input mapping can be released later.
+        let total: usize = slots.iter().filter(|s| s.0 != 0).map(|s| (s.1 >> 48) as usize).sum();
+        let mut bytes: Vec<u8> = Vec::with_capacity(total);
+        let base = bytes.as_ptr() as u64;
+        for s in slots.iter_mut().filter(|s| s.0 != 0) {
+            let b = unsafe { span(s.1) };
+            let off = bytes.len() as u64;
+            bytes.extend_from_slice(b);
+            s.1 = (base + off) | ((b.len() as u64) << 48);
+        }
+        debug_assert_eq!(bytes.as_ptr() as u64, base);
+        (LongPart { slots, bytes }, ok)
     }
 
     fn get(&self, k: u64) -> &'static [u8] {
