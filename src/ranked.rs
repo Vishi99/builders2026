@@ -1,6 +1,7 @@
 use crate::aggregate::packed::{self, PackedRun, PackedTile};
 use crate::aggregate::{Activity, Run};
 use crate::click_index::{self, COMPACT_KEY};
+use crate::keys::ordered_event_key;
 use crate::linkdir::{Canonical, LinkDirectory};
 use crate::rank::Layout;
 use crate::user_rank::UserLayout;
@@ -157,7 +158,6 @@ struct Staged {
     wide: Vec<Vec<WideTicket>>,
     spill: Parts<CopyRecord<u32>>,
     clock: csv::Clock,
-    scan_time: std::time::Duration,
 }
 
 type RunParts = [(Vec<Run>, Vec<Activity<u32>>); LANES];

@@ -1,5 +1,4 @@
-FROM rust:1.89.0-slim-bookworm AS build
-ARG RUST_VERSION=1.85.0
+ARG RUST_VERSION=1.89.0
 FROM rust:${RUST_VERSION}-slim-bookworm AS build
 ARG TARGETARCH
 ARG NATIVE_AMD64_ARCH=x86-64-v3
@@ -15,6 +14,5 @@ FROM debian:bookworm-slim
 ARG SHOPPING_EVENT_SCANNER=auto
 ENV SHOPPING_EVENT_SCANNER=$SHOPPING_EVENT_SCANNER
 COPY --from=build /build/target/release/shopping-sessions /usr/local/bin/shopping-sessions
-ENV J2_BATCH_SCAN=1 J2_BATCH_RANK=avx512
 USER 1000:1000
 CMD ["/usr/local/bin/shopping-sessions"]

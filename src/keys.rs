@@ -1,9 +1,11 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const LONG_ID: u64 = 1 << 63;
+const NAME_SHARDS: usize = 64;
+const NAME_SHARD_BITS: u32 = NAME_SHARDS.trailing_zeros();
 
 #[inline]
 pub fn spread(mut bits: u64) -> u64 {
@@ -59,13 +61,18 @@ pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<KeyHasher>>;
 
 #[derive(Default)]
 struct LongNames {
-    ids: FastMap<Vec<u8>, u64>,
-    names: Vec<Vec<u8>>,
+    ids: FastMap<Arc<[u8]>, u64>,
+    names: Vec<Arc<[u8]>>,
 }
 
 /// Zero is reserved for the empty ID. Short IDs preserve byte order.
-#[derive(Default)]
-pub struct Names(Mutex<LongNames>);
+pub struct Names([Mutex<LongNames>; NAME_SHARDS]);
+
+impl Default for Names {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| Mutex::default()))
+    }
+}
 
 impl Names {
     #[inline]
@@ -77,42 +84,68 @@ impl Names {
     }
 
     fn intern(&self, bytes: &[u8]) -> u64 {
-        let mut names = self.0.lock().unwrap();
+        let shard = byte_hash(bytes) as usize & (NAME_SHARDS - 1);
+        let mut names = self.0[shard].lock().unwrap();
         if let Some(&key) = names.ids.get(bytes) {
             return key;
         }
-        let key = LONG_ID | names.names.len() as u64;
-        let owned = bytes.to_vec();
-        names.names.push(owned.clone());
+        let key = LONG_ID | ((names.names.len() as u64) << NAME_SHARD_BITS) | shard as u64;
+        let owned = Arc::from(bytes);
+        names.names.push(Arc::clone(&owned));
         names.ids.insert(owned, key);
         key
     }
 
     #[inline]
     pub fn compare(&self, left: u64, right: u64) -> Ordering {
-        if (left | right) & LONG_ID == 0 {
+        if left == right || (left | right) & LONG_ID == 0 {
             return left.cmp(&right);
         }
-        let mut first = Vec::new();
-        let mut second = Vec::new();
-        self.append(left, &mut first);
-        self.append(right, &mut second);
-        first.cmp(&second)
+        let a = (left & LONG_ID == 0).then(|| unpack_short(left));
+        let b = (right & LONG_ID == 0).then(|| unpack_short(right));
+        let a_long = a.is_none().then(|| self.long_name(left));
+        let b_long = b.is_none().then(|| self.long_name(right));
+        let a = a
+            .as_ref()
+            .map_or_else(|| a_long.as_deref().unwrap(), |(bytes, len)| &bytes[..*len]);
+        let b = b
+            .as_ref()
+            .map_or_else(|| b_long.as_deref().unwrap(), |(bytes, len)| &bytes[..*len]);
+        a.cmp(b)
     }
 
     pub fn append(&self, id: u64, to: &mut Vec<u8>) {
         if id & LONG_ID != 0 {
-            to.extend_from_slice(&self.0.lock().unwrap().names[(id ^ LONG_ID) as usize]);
+            let (shard, index) = long_position(id);
+            to.extend_from_slice(&self.0[shard].lock().unwrap().names[index]);
             return;
         }
-        for shift in (0..=56).rev().step_by(7) {
-            let byte = (id >> shift) as u8 & 127;
-            if byte == 0 {
-                return;
-            }
-            to.push(byte);
+        let (bytes, length) = unpack_short(id);
+        to.extend_from_slice(&bytes[..length]);
+    }
+
+    fn long_name(&self, id: u64) -> Arc<[u8]> {
+        let (shard, index) = long_position(id);
+        Arc::clone(&self.0[shard].lock().unwrap().names[index])
+    }
+}
+
+fn long_position(id: u64) -> (usize, usize) {
+    (
+        id as usize & (NAME_SHARDS - 1),
+        ((id ^ LONG_ID) >> NAME_SHARD_BITS) as usize,
+    )
+}
+
+fn unpack_short(id: u64) -> ([u8; 9], usize) {
+    let mut bytes = [0; 9];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = (id >> (56 - i * 7)) as u8 & 127;
+        if *byte == 0 {
+            return (bytes, i);
         }
     }
+    (bytes, 9)
 }
 
 #[inline]
@@ -189,15 +222,7 @@ pub(crate) fn signature_projection(number: u64) -> u64 {
 /// Used only to mark possible duplicate rows. All candidates are compared
 /// using the original input ID. Collisions cost work and preserve correctness.
 #[inline]
-pub fn event_signature(bytes: &[u8]) -> u64 {
-    if let [b'e', suffix @ ..] = bytes {
-        if let Some(number) = compact_number(suffix) {
-            // A reversible shuffle of the 40-bit numeric domain. Inverting
-            // the generator's public final mixing step improves locality in
-            // a power-of-two bitmap without recovering any generator keys.
-            return signature_projection(number);
-        }
-    }
+pub fn byte_hash(bytes: &[u8]) -> u64 {
     let mut hash = KeyHasher::default();
     hash.write(bytes);
     hash.finish()

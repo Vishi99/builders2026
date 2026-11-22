@@ -10,7 +10,7 @@ mod ranked;
 mod user_rank;
 
 use aggregate::{Click, Event};
-use keys::{event_signature, ordered_event_key, spread, FastMap, Names};
+use keys::{byte_hash, spread, FastMap, Names};
 use output::{CampaignDay, UserDay};
 use serde_json::Value;
 use std::array;
@@ -297,39 +297,39 @@ fn aliases(path: &Path, names: &Names) -> io::Result<FastMap<u64, u64>> {
     Ok(aliases)
 }
 
-// Each worker owns its bitmap. Merge marks a signature when any worker has
-// seen it twice or when different workers have both seen it. A clear bit
-// certifies uniqueness, even for inputs that have shape or hash collisions.
-#[derive(Default)]
-struct Census {
-    seen: Vec<u64>,
-    repeat: Vec<u32>,
+#[derive(Clone, Copy, Default)]
+struct CensusWord {
+    seen: u64,
+    repeat: u64,
+}
+
+#[inline]
+fn census_position(hash: u64, words: usize) -> (usize, u64) {
+    // Two positions in one word give a single lookup and much fewer
+    // false positives than a one-bit signature at the same capacity.
+    let word = (hash >> 10) as usize & (words - 1);
+    let mask = (1 << (hash & 31)) | (1 << (32 + ((hash >> 5) & 31)));
+    (word, mask)
 }
 
 fn count_duplicates(input: &[&[u8]], bytes: usize, threads: usize) -> Vec<u64> {
-    let slots = (bytes / 55).clamp(1024, 1 << 27).next_power_of_two();
+    let words = (bytes / (16 * 64)).clamp(16, 1 << 22).next_power_of_two();
     let mut timer = Timer(Instant::now());
-    let mut batches = work(
+    let batches = work(
         input.len(),
         threads,
-        || Census {
-            seen: vec![0; slots / 64],
-            repeat: Vec::new(),
-        },
+        || vec![CensusWord::default(); words],
         |i, local| {
             csv::event_ids(input[i], |id| {
-                let position = event_signature(id) as usize & (slots - 1);
-                let bit = 1u64 << (position & 63);
-                let cell = &mut local.seen[position >> 6];
-                if *cell & bit != 0 {
-                    local.repeat.push(position as u32);
-                }
-                *cell |= bit;
+                let (word, mask) = census_position(byte_hash(id), words);
+                let cell = &mut local[word];
+                cell.repeat |= cell.seen & mask;
+                cell.seen |= mask;
             })
         },
     );
     timer.lap("  Scan event IDs (overlapped)");
-    let mut ambiguous = vec![0u64; slots / 64];
+    let mut ambiguous = vec![0u64; words];
     let block_words = ambiguous.len().div_ceil(threads);
     thread::scope(|scope| {
         for (block, output) in ambiguous.chunks_mut(block_words).enumerate() {
@@ -339,20 +339,14 @@ fn count_duplicates(input: &[&[u8]], bytes: usize, threads: usize) -> Vec<u64> {
                 for (offset, result) in output.iter_mut().enumerate() {
                     let mut seen = 0;
                     for local in batches {
-                        let word = local.seen[start + offset];
-                        *result |= seen & word;
-                        seen |= word;
+                        let word = local[start + offset];
+                        *result |= word.repeat | (seen & word.seen);
+                        seen |= word.seen;
                     }
                 }
             });
         }
     });
-    for batch in &mut batches {
-        for &position in &batch.repeat {
-            let position = position as usize;
-            ambiguous[position >> 6] |= 1u64 << (position & 63);
-        }
-    }
     timer.lap("  Merge duplicate signatures (overlapped)");
     ambiguous
 }
@@ -382,24 +376,43 @@ struct CopyRecord<T> {
     event: Event<T>,
 }
 
-struct Batch<T> {
+struct EventId<'a> {
+    bytes: &'a [u8],
+    hash: u64,
+}
+
+impl PartialEq for EventId<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.bytes == other.bytes
+    }
+}
+
+impl Eq for EventId<'_> {}
+
+struct EventCopy<'a, T> {
+    id: EventId<'a>,
+    ingest: i64,
+    event: Event<T>,
+}
+
+struct Batch<'a, T> {
     events: Parts<Event<T>>,
     clicks: Parts<Click<T>>,
     pending_events: Parts<Event<T>>,
     pending_clicks: Parts<Click<T>>,
-    conflicts: Parts<CopyRecord<T>>,
+    conflicts: Parts<EventCopy<'a, T>>,
     cache: Box<[Cache]>,
     clock: csv::Clock,
 }
 
-impl<T> Batch<T> {
-    fn new(copies: usize) -> Self {
+impl<T> Batch<'_, T> {
+    fn new(estimate: usize, all_exact: bool) -> Self {
         Self {
-            events: array::from_fn(|_| Vec::with_capacity(copies)),
-            clicks: array::from_fn(|_| Vec::with_capacity(copies / 4)),
+            events: array::from_fn(|_| Vec::with_capacity(if all_exact { 0 } else { estimate })),
+            clicks: array::from_fn(|_| Vec::with_capacity(estimate / 4)),
             pending_events: array::from_fn(|_| Vec::new()),
             pending_clicks: array::from_fn(|_| Vec::new()),
-            conflicts: array::from_fn(|_| Vec::new()),
+            conflicts: array::from_fn(|_| Vec::with_capacity(if all_exact { estimate } else { 0 })),
             cache: vec![ZERO_CACHE; 4096].into_boxed_slice(),
             clock: csv::Clock::new(),
         }
@@ -407,17 +420,22 @@ impl<T> Batch<T> {
 
     #[inline]
     fn canonical(&mut self, raw: u64, aliases: &FastMap<u64, u64>) -> (u64, usize) {
-        let entry = &mut self.cache[spread(raw) as usize & 4095];
-        if entry.raw != raw {
-            let person = aliases.get(&raw).copied().unwrap_or(raw);
-            *entry = Cache {
-                raw,
-                person,
-                owner: owner(person),
-            };
-        }
-        (entry.person, entry.owner)
+        cached_owner(&mut self.cache, raw, aliases)
     }
+}
+
+#[inline]
+fn cached_owner(cache: &mut [Cache], raw: u64, aliases: &FastMap<u64, u64>) -> (u64, usize) {
+    let entry = &mut cache[spread(raw) as usize & (cache.len() - 1)];
+    if entry.raw != raw {
+        let person = aliases.get(&raw).copied().unwrap_or(raw);
+        *entry = Cache {
+            raw,
+            person,
+            owner: owner(person),
+        };
+    }
+    (entry.person, entry.owner)
 }
 
 struct Dataset<'a> {
@@ -429,7 +447,6 @@ struct Dataset<'a> {
     start: i64,
     end: i64,
     late_route: bool,
-    direct_slots: bool,
     overflow: Mutex<Vec<(u32, u32)>>,
 }
 
@@ -451,18 +468,26 @@ impl Dataset<'_> {
         (index as u32) | WIDE_PURCHASE
     }
 
-    fn events<T: TryFrom<i64>>(&self, input: &[u8], ambiguous: &[u64], batch: &mut Batch<T>) {
+    fn events<'a, T: TryFrom<i64>>(
+        &self,
+        input: &'a [u8],
+        ambiguous: &[u64],
+        batch: &mut Batch<'a, T>,
+    ) {
         let aliases = (!self.late_route).then(|| self.aliases.get()).flatten();
         csv::event_rows(input, |row| {
-            if row.field::<0>().is_empty() {
+            let id = row.field::<0>();
+            if id.is_empty() {
                 return;
             }
+            let hash = byte_hash(id);
+            // A clear bit certifies uniqueness. Both set bits still require
+            // arbitration against the original ID bytes.
             let conflict = if ambiguous.is_empty() {
                 true
             } else {
-                let position =
-                    event_signature(row.field::<0>()) as usize & (ambiguous.len() * 64 - 1);
-                ambiguous[position >> 6] & (1u64 << (position & 63)) != 0
+                let (word, mask) = census_position(hash, ambiguous.len());
+                ambiguous[word] & mask == mask
             };
             let candidate = self.event_fields(&row, &mut batch.clock);
             if !conflict && candidate.is_none() {
@@ -482,19 +507,17 @@ impl Dataset<'_> {
                     })
                 });
             if conflict {
-                let (id, bucket) = if self.direct_slots {
-                    let id = ordered_event_key(row.field::<0>(), &self.ids);
-                    (id, id as usize & (LANES - 1))
-                } else {
-                    let id = self.ids.key(row.field::<0>());
-                    (id, owner(id))
-                };
+                let bucket = hash as usize & (LANES - 1);
                 let event = payload.unwrap_or_else(|| Event {
                     person: 0,
                     time: T::try_from(0).ok().unwrap(),
                     purchase: 0,
                 });
-                batch.conflicts[bucket].push(CopyRecord { id, ingest, event });
+                batch.conflicts[bucket].push(EventCopy {
+                    id: EventId { bytes: id, hash },
+                    ingest,
+                    event,
+                });
             } else if let Some(mut event) = payload {
                 if let Some(aliases) = aliases {
                     let (person, owner) = batch.canonical(event.person, aliases);
@@ -534,7 +557,12 @@ impl Dataset<'_> {
         Some((time, 0))
     }
 
-    fn clicks<T: TryFrom<i64>>(&self, input: &[u8], batch: &mut Batch<T>) {
+    fn clicks<T: TryFrom<i64>>(
+        &self,
+        input: &[u8],
+        batch: &mut Batch<'_, T>,
+        click_key: impl Fn(&[u8]) -> u64,
+    ) {
         let base = self.start - WEEK;
         let aliases = (!self.late_route).then(|| self.aliases.get()).flatten();
         csv::rows::<4>(input, |[id, user, campaign, stamp]| {
@@ -551,7 +579,7 @@ impl Dataset<'_> {
                 return;
             }
             let raw = self.names.key(user);
-            let id = self.click_ids.key(id);
+            let id = click_key(id);
             if let Ok(time) = T::try_from(stamp - base) {
                 // The published click-ID duplicates have identical contents.
                 // Latest-click selection and one assist per campaign are
@@ -592,10 +620,9 @@ fn stripes<T>(parts: Vec<Parts<T>>) -> Vec<Vec<Vec<T>>> {
 }
 
 fn winners<T: Copy + Send>(
-    parts: Vec<Parts<CopyRecord<T>>>,
+    parts: Vec<Parts<EventCopy<'_, T>>>,
     threads: usize,
     aliases: &FastMap<u64, u64>,
-    direct: bool,
 ) -> Vec<Parts<Event<T>>> {
     let jobs: Vec<_> = stripes(parts)
         .into_iter()
@@ -604,40 +631,64 @@ fn winners<T: Copy + Send>(
     work(
         jobs.len(),
         threads,
-        || array::from_fn(|_| Vec::new()),
-        |index, out| {
+        || (array::from_fn(|_| Vec::new()), vec![ZERO_CACHE; 4096]),
+        |index, (out, cache)| {
             let mut stripes = jobs[index].lock().unwrap().take().unwrap();
             let count = stripes.iter().map(Vec::len).sum::<usize>();
-            if direct {
-                dense_winners(&mut stripes, count);
-                for rows in stripes {
-                    for row in rows {
-                        emit_winner(row.event, out, aliases);
+            select_event_winners(&mut stripes, count);
+            for rows in stripes {
+                for mut row in rows {
+                    if row.event.person != 0 {
+                        let (person, target) = cached_owner(cache, row.event.person, aliases);
+                        row.event.person = person;
+                        out[target].push(row.event);
                     }
                 }
-                return;
-            }
-            let mut seen = FastMap::with_capacity_and_hasher(count, Default::default());
-            for rows in &stripes {
-                for row in rows {
-                    let winner = seen.entry(row.id).or_insert(row);
-                    if row.ingest < winner.ingest {
-                        *winner = row;
-                    }
-                }
-            }
-            for row in seen.into_values() {
-                emit_winner(row.event, out, aliases);
             }
         },
     )
+    .into_iter()
+    .map(|(out, _cache)| out)
+    .collect()
 }
 
-#[inline]
-fn emit_winner<T>(mut event: Event<T>, out: &mut Parts<Event<T>>, aliases: &FastMap<u64, u64>) {
-    if event.person != 0 {
-        event.person = aliases.get(&event.person).copied().unwrap_or(event.person);
-        out[owner(event.person)].push(event);
+fn select_event_winners<T>(stripes: &mut [Vec<EventCopy<'_, T>>], count: usize) {
+    // Each partition owns its table. Slots store a fingerprint and the
+    // winning record's location so probing stays in a compact array.
+    let size = (count + count / 3 + 1).next_power_of_two();
+    let mut slots = vec![0u64; size];
+    for stripe in 0..stripes.len() {
+        for index in 0..stripes[stripe].len() {
+            let current = &stripes[stripe][index];
+            let hash = current.id.hash;
+            let fingerprint = hash >> 48;
+            let location = ((stripe as u64) << 32) | (index as u64 + 1);
+            let handle = (location << 16) | fingerprint;
+            let mut probe = (hash >> LANES.trailing_zeros()) as usize & (size - 1);
+            loop {
+                let slot = &mut slots[probe];
+                let prior = *slot;
+                if prior == 0 {
+                    *slot = handle;
+                    break;
+                }
+                if prior & 0xffff == fingerprint {
+                    let other_stripe = (prior >> 48) as usize;
+                    let other_index = ((prior >> 16) as u32 - 1) as usize;
+                    let other = &stripes[other_stripe][other_index];
+                    if current.id == other.id {
+                        if current.ingest < other.ingest {
+                            stripes[other_stripe][other_index].event.person = 0;
+                            *slot = handle;
+                        } else {
+                            stripes[stripe][index].event.person = 0;
+                        }
+                        break;
+                    }
+                }
+                probe = (probe + 1) & (size - 1);
+            }
+        }
     }
 }
 
@@ -709,19 +760,7 @@ fn resolve_pending<T: Copy + Send>(
         },
         |index, result| {
             let (mut events, mut clicks) = jobs[index].lock().unwrap().take().unwrap();
-            let canonical = &mut result.canonical;
-            let mut translate = |raw| {
-                let entry = &mut canonical[spread(raw) as usize & 16_383];
-                if raw != entry.raw {
-                    let person = aliases.get(&raw).copied().unwrap_or(raw);
-                    *entry = Cache {
-                        raw,
-                        person,
-                        owner: owner(person),
-                    };
-                }
-                (entry.person, entry.owner)
-            };
+            let mut translate = |raw| cached_owner(&mut result.canonical, raw, aliases);
             for stripe in &mut events {
                 stripe.retain_mut(|event| {
                     let (person, target) = translate(event.person);
@@ -760,16 +799,31 @@ fn solve<T: Copy + Send + Ord + Into<i64> + TryFrom<i64>>(
     timer: &mut Timer,
     wait_links: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
-    let estimate = (event_bytes / 95 / threads / LANES).min(1 << 17);
+    let estimate = (event_bytes / 75 / threads / LANES).min(1 << 17);
+    // The input stays mapped until attribution finishes. A click ID is
+    // needed only for ties, so keep a location instead of interning it.
+    let borrow_click_ids = click_chunks.len() <= u32::MAX as usize
+        && click_chunks
+            .iter()
+            .all(|chunk| chunk.len() <= u32::MAX as usize);
     let batches = work(
         event_chunks.len() + click_chunks.len(),
         threads,
-        || Batch::<T>::new(estimate),
+        || Batch::<T>::new(estimate, ambiguous.is_empty()),
         |index, batch| {
             if index < event_chunks.len() {
                 data.events(event_chunks[index], ambiguous, batch);
             } else {
-                data.clicks(click_chunks[index - event_chunks.len()], batch);
+                let chunk_index = index - event_chunks.len();
+                let chunk = click_chunks[chunk_index];
+                data.clicks(chunk, batch, |id| {
+                    if borrow_click_ids {
+                        let offset = id.as_ptr() as usize - chunk.as_ptr() as usize;
+                        ((chunk_index as u64) << 32) | offset as u64
+                    } else {
+                        data.click_ids.key(id)
+                    }
+                });
             }
         },
     );
@@ -789,7 +843,7 @@ fn solve<T: Copy + Send + Ord + Into<i64> + TryFrom<i64>>(
     wait_links()?;
     timer.lap("Wait for links");
     let aliases = data.aliases.get().unwrap();
-    event_parts.extend(winners(conflicts, threads, aliases, data.direct_slots));
+    event_parts.extend(winners(conflicts, threads, aliases));
     timer.lap("Arbitrate possible duplicate IDs and route winners");
     let mut retained = Vec::new();
     for batch in resolve_pending(pending_events, pending_clicks, threads, aliases) {
@@ -811,6 +865,21 @@ fn solve<T: Copy + Send + Ord + Into<i64> + TryFrom<i64>>(
         .zip(clicks)
         .map(|pair| Mutex::new(Some(pair)))
         .collect();
+    let click_id = |location: u64| {
+        let chunk = click_chunks[(location >> 32) as usize];
+        let tail = &chunk[location as u32 as usize..];
+        // The location starts after a possible opening quote. The CSV
+        // dialect excludes literal commas and quotes inside the value.
+        let end = tail.iter().position(|&b| matches!(b, b',' | b'"')).unwrap();
+        &tail[..end]
+    };
+    let compare_clicks = |a, b| {
+        if borrow_click_ids {
+            click_id(a).cmp(click_id(b))
+        } else {
+            data.click_ids.compare(a, b)
+        }
+    };
     let by_worker: Vec<(Vec<UserDay>, aggregate::CampaignGrid)> = work(
         jobs.len(),
         threads,
@@ -832,7 +901,7 @@ fn solve<T: Copy + Send + Ord + Into<i64> + TryFrom<i64>>(
                 (data.start, data.start - WEEK),
                 data.dimensions.categories.len(),
                 &overflow,
-                &|a, b| data.click_ids.compare(a, b),
+                &compare_clicks,
                 &mut result.0,
                 &mut result.1,
             );
@@ -956,9 +1025,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let names = Names::default();
     let dimensions = Dimensions::load(&data)?;
     timer.lap("Map shards and load dimensions");
-    let dedup = std::env::var("J2_DEDUP").unwrap_or_else(|_| "rank".into());
-    let direct_slots = dedup == "direct" || dedup == "rank";
-    let all_exact = direct_slots || dedup == "exact";
+    let dedup = std::env::var("J2_DEDUP").unwrap_or_else(|_| "exact".into());
     let linked = OnceLock::new();
     if dedup == "rank" && u32::try_from(end - (start - WEEK)).is_ok() {
         let link_files = csv::map_dir(&data.join("links"))?;
@@ -985,7 +1052,6 @@ fn run() -> Result<(), Box<dyn Error>> {
                     start,
                     end,
                     late_route: false,
-                    direct_slots: true,
                     overflow: Mutex::new(Vec::new()),
                 };
                 ranked::solve(
@@ -1020,7 +1086,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             None
         };
         let census_workers = workers.saturating_sub(usize::from(links.is_some())).max(1);
-        let ambiguous = if all_exact {
+        let ambiguous = if matches!(dedup.as_str(), "exact" | "direct" | "rank") {
             Vec::new()
         } else {
             count_duplicates(&event_chunks, event_bytes, census_workers)
@@ -1047,7 +1113,6 @@ fn run() -> Result<(), Box<dyn Error>> {
             start,
             end,
             late_route: std::env::var("J2_ROUTE").as_deref() == Ok("late"),
-            direct_slots,
             overflow: Mutex::new(Vec::new()),
         };
         if u32::try_from(end - (start - WEEK)).is_ok() {
@@ -1087,5 +1152,40 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("shopping-sessions: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod opaque_id_tests {
+    use super::*;
+
+    #[test]
+    fn earliest_invalid_copy_wins_without_merging_hash_collisions() {
+        let record = |bytes, ingest, person| EventCopy {
+            id: EventId {
+                bytes,
+                // Force the full fingerprint to collide.
+                hash: 42,
+            },
+            ingest,
+            event: Event {
+                person,
+                time: 0u32,
+                purchase: 0,
+            },
+        };
+        let long = &b"e0123456789abcdef0123456789abcdef"[..];
+        let mut stripes = [
+            vec![record(long, 12, 7), record(b"other", 4, 3)],
+            vec![record(long, 10, 0), record(b"other", 1, 4)],
+            vec![record(long, 11, 8)],
+        ];
+        select_event_winners(&mut stripes, 5);
+        let people: Vec<_> = stripes
+            .iter()
+            .flatten()
+            .map(|row| row.event.person)
+            .collect();
+        assert_eq!(people, [0, 0, 0, 4, 0]);
     }
 }
