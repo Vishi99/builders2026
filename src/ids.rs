@@ -362,12 +362,16 @@ impl LongPart {
     /// kept per spelling, and two spellings with one key but different
     /// second hashes are reported (the caller then runs the exact generic
     /// pipeline). Bytes of the first spelling are kept for lookups.
-    pub fn build(recs: &[&crate::stream::Stream]) -> (LongPart, bool) {
+    pub fn build(recs: &[&crate::stream::Stream], check: &mut Vec<u64>) -> (LongPart, bool) {
         let n: usize = recs.iter().map(|r| r.count).sum();
-        let cap = (n * 2).max(4).next_power_of_two();
+        // Records include repeats of one spelling; size for about half.
+        let cap = (n + n / 2).max(4).next_power_of_two();
         let mut slots = vec![(0u64, 0u64); cap];
-        let mut check = vec![0u64; cap];
+        if check.len() < cap {
+            *check = vec![0; cap];
+        }
         let mut ok = true;
+        let mut used = 0usize;
         for r in recs {
             r.for_each_block::<LongRec>(|b| {
                 for &LongRec { k, v, h2 } in b {
@@ -377,6 +381,7 @@ impl LongPart {
                         if s.0 == 0 {
                             *s = (k, v);
                             check[h] = h2;
+                            used += 1;
                             break;
                         }
                         if s.0 == k {
@@ -390,6 +395,7 @@ impl LongPart {
                 }
             });
         }
+        let _ = used;
         // Own the bytes so the input mapping can be released later.
         let total: usize = slots.iter().filter(|s| s.0 != 0).map(|s| (s.1 >> 48) as usize).sum();
         let mut bytes: Vec<u8> = Vec::with_capacity(total);

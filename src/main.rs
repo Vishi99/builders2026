@@ -485,6 +485,7 @@ fn phase_longs(sh: &Shared, tid: usize) {
     let tab = unsafe { sh.longtab.get().as_mut().unwrap() } as *mut LongTable;
     let mut scratch = Vec::new();
     let mut gens = Vec::new();
+    let mut check: Vec<u64> = Vec::new();
     let mut gen = 0u32;
     loop {
         let p = sh.claim(8);
@@ -500,7 +501,7 @@ fn phase_longs(sh: &Shared, tid: usize) {
             continue;
         }
         let recs: Vec<&Stream> = (0..nt).map(|t| &sh.local(t).longs.parts[p]).collect();
-        let (lp, ok) = ids::LongPart::build(&recs);
+        let (lp, ok) = ids::LongPart::build(&recs, &mut check);
         if !ok {
             sh.exotic.store(true, Ordering::Relaxed);
         }
