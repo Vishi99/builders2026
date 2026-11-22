@@ -980,7 +980,8 @@ fn phase_sessions(sh: &Shared, tid: usize) {
             continue;
         }
         // Cells keyed by (person key, bucket): generation-tagged slots.
-        let cbits = ((n / 2).max(16)).next_power_of_two().trailing_zeros() + 1;
+        // At least one empty slot even if every record is its own cell.
+        let cbits = ((n + 1).max(16)).next_power_of_two().trailing_zeros();
         let ccap = 1usize << cbits;
         if ctab.len() < ccap || cgen >= (1 << 20) - 1 {
             ctab = vec![CSlot::default(); ccap.max(ctab.len())];
