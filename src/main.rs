@@ -1376,7 +1376,8 @@ fn main() {
                 win: vec![Stream::new(); nu],
                 per: vec![Stream::new(); nu],
                 pclk: vec![Stream::new(); nu],
-                out: Some(Out::new(ncamp, ndays, day0, ws)),
+                // About one user_daily row per nine events (a quarter spare).
+                out: Some(Out::new(ncamp, ndays, day0, ws, ev_bytes / 80 / 9 / nt * 5 / 4)),
                 longmins: Vec::new(),
                 exotic: false,
             })

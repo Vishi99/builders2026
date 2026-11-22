@@ -75,9 +75,9 @@ pub struct Out {
 }
 
 impl Out {
-    pub fn new(ncamp: usize, ndays: usize, day0: i64, ws_ms: i64) -> Out {
+    pub fn new(ncamp: usize, ndays: usize, day0: i64, ws_ms: i64, rows_hint: usize) -> Out {
         Out {
-            rows: Vec::with_capacity(1 << 16),
+            rows: Vec::with_capacity(rows_hint.max(1 << 12)),
             camp: Vec::new(),
             cred: vec![Cred::default(); ncamp * ndays],
             assist: vec![0; ncamp * ndays],
