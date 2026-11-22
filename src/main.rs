@@ -695,8 +695,13 @@ fn phase_dedup(sh: &Shared, tid: usize) {
         };
         for t in 0..nt {
             let src = sh.local(t).ev[d];
+            let tp = table.as_ptr();
             src.for_each_block::<EvRec>(|b| {
-                for r in b {
+                for (j, r) in b.iter().enumerate() {
+                    if let Some(f) = b.get(j + 8) {
+                        let fh = part(f.ekey, MUL_T, bits);
+                        unsafe { std::arch::x86_64::_mm_prefetch(tp.add(fh) as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+                    }
                     let mut h = part(r.ekey, MUL_T, bits);
                     loop {
                         let s = unsafe { table.get_unchecked_mut(h) };
