@@ -316,6 +316,16 @@ unsafe fn parse_events(sh: &Shared, lo: &mut Local, base: *const u8, len: usize)
         if l0 == 0 {
             return;
         }
+        let l1 = fl(1);
+        // A long user ID: hash it now and start loading its cache slot, so
+        // the load overlaps the timestamp work below.
+        let uh = if l1 > 10 {
+            let h = ids::hash2(fp(1), l1);
+            longs.prefetch(h.1);
+            h
+        } else {
+            (0, 0)
+        };
         let ekey = event_key(fp(0), l0, longs);
         let (p3, l3) = (fp(3), fl(3));
         let ing = if l3 == 20 { ts::parse_f12_simd(p3, 20, clock) } else { ts::parse_ts(p3, l3, clock) };
@@ -334,7 +344,6 @@ unsafe fn parse_events(sh: &Shared, lo: &mut Local, base: *const u8, len: usize)
         }
         let irel = irel as u32;
         let d = part(ekey, MUL_D, bits_d);
-        let l1 = fl(1);
         let l4 = fl(4);
         let p4 = fp(4);
         let w4 = load32(p4);
@@ -367,7 +376,7 @@ unsafe fn parse_events(sh: &Shared, lo: &mut Local, base: *const u8, len: usize)
             return;
         }
         if valid {
-            let ukey = user_key(fp(1), l1, longs);
+            let ukey = if l1 > 10 { longs.key_cached_h(uh.0, uh.1, fp(1), l1) } else { user_key(fp(1), l1, longs) };
             let mut tr = (t - ws) as u32;
             if is_purchase {
                 tr |= PURCHASE;
@@ -398,6 +407,13 @@ unsafe fn parse_clicks(sh: &Shared, lo: &mut Local, base: *const u8, len: usize)
         if l0 == 0 || l1 == 0 {
             return;
         }
+        let uh = if l1 > 10 {
+            let h = ids::hash2(fp(1), l1);
+            longs.prefetch(h.1);
+            h
+        } else {
+            (0, 0)
+        };
         let camp = dims.campaign(std::slice::from_raw_parts(fp(2), fl(2)));
         if camp == 0 {
             return;
@@ -407,7 +423,7 @@ unsafe fn parse_clicks(sh: &Shared, lo: &mut Local, base: *const u8, len: usize)
             _ => return,
         };
         let ckey = id_key(fp(0), l0, longs);
-        let ukey = user_key(fp(1), l1, longs);
+        let ukey = if l1 > 10 { longs.key_cached_h(uh.0, uh.1, fp(1), l1) } else { user_key(fp(1), l1, longs) };
         let u = part(ukey, MUL_U, bits_u);
         clk.get_unchecked_mut(u).push(pool, ClkRec { ckey, key: ukey, ts: (t - cbase) as u32, camp });
     });
@@ -751,25 +767,27 @@ fn phase_dedup(sh: &Shared, tid: usize) {
     }
 }
 
+/// Drop this worker's share of the input mapping's page-table entries, in
+/// parallel, so exit does not tear them down on one thread. Long IDs point
+/// into the input, so this runs only after every output is written.
+fn release_input(sh: &Shared, tid: usize) {
+    const PIECE: usize = 64 << 20;
+    let mut k = 0usize;
+    for &(p, l) in &sh.ranges {
+        let mut off = 0;
+        while off < l {
+            if k % sh.nt == tid {
+                sys::release_range((p + off) as *const u8, PIECE.min(l - off));
+            }
+            k += 1;
+            off += PIECE;
+        }
+    }
+}
+
 /// Map users to persons. Records whose person partition is this partition
 /// stay in place with the person key written in; others move.
 fn phase_route(sh: &Shared, tid: usize) {
-    // Input bytes are no longer needed (long IDs own their bytes): drop this
-    // worker's share of the mapping's page-table entries in parallel.
-    {
-        const PIECE: usize = 64 << 20;
-        let mut k = 0usize;
-        for &(p, l) in &sh.ranges {
-            let mut off = 0;
-            while off < l {
-                if k % sh.nt == tid {
-                    sys::release_range((p + off) as *const u8, PIECE.min(l - off));
-                }
-                k += 1;
-                off += PIECE;
-            }
-        }
-    }
     let nt = sh.nt;
     let nu = 1usize << sh.bits_u;
     let bits_u = sh.bits_u;
@@ -1244,6 +1262,7 @@ fn worker(sh: &Shared, tid: usize) {
     }
     sh.barrier.wait();
     sh.lap(tid, "write");
+    release_input(sh, tid);
 }
 
 // ----------------------------------------------------------------- output
@@ -1326,7 +1345,9 @@ fn main() {
     }
     let t_map = t0.elapsed().as_secs_f64();
     let ranges: Vec<(usize, usize)> = maps.iter().filter(|m| m.len > 0).map(|m| (m.ptr as usize, m.len)).collect();
-    let bits_d = bits_for(ev_bytes / 78, 9000, 4, 14);
+    // Dedup partitions of about 18,000 copies: fewer open streams while
+    // parsing, and a dedup table that still fits in L2.
+    let bits_d = bits_for(ev_bytes / 78, 18000, 4, 14);
     let bits_u = bits_for(ev_bytes / 80 + ck_bytes / 48, 12000, 4, 14);
     let bits_l = bits_for(lk_bytes / 10, 8000, 2, 12);
     let ncamp = dims.campaign_ids.len();
@@ -1336,7 +1357,7 @@ fn main() {
     let nu = 1usize << bits_u;
     // Expected long-ID sightings per thread and registry part (1 in 8 IDs
     // in generated data), with slack; vectors still grow if needed.
-    let bits_long = bits_d.saturating_sub(3).max(2);
+    let bits_long = bits_for(ev_bytes / 78, 9000, 4, 14).saturating_sub(3).max(2);
     let _long_per_part = ((ev_bytes / 80 + ck_bytes / 48 + lk_bytes / 20) * 2 / 8 / nt / 256) * 5 / 4 + 16;
     let nl = 1usize << bits_l;
     let locals = (0..nt)

@@ -261,6 +261,26 @@ impl LongIds {
         k
     }
 
+    /// Start loading the cache slot of a long ID hashed early.
+    #[inline(always)]
+    pub fn prefetch(&self, h2: u64) {
+        let slot = (h2 as usize) & (LCACHE - 1);
+        unsafe { std::arch::x86_64::_mm_prefetch(self.cache.as_ptr().add(slot) as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+    }
+
+    /// `key_cached` with the hashes already computed.
+    #[inline(always)]
+    pub unsafe fn key_cached_h(&mut self, h1: u64, h2: u64, p: *const u8, len: usize) -> u64 {
+        let k = LONG | (h1 >> 1);
+        let slot = (h2 as usize) & (LCACHE - 1);
+        let c = self.cache.get_unchecked_mut(slot);
+        if c.0 != k || c.1 != h2 {
+            *c = (k, h2);
+            self.record(k, h2, p, len);
+        }
+        k
+    }
+
     /// A long ID that repeats (user IDs): a small cache skips repeats.
     #[inline(never)]
     pub unsafe fn key_cached(&mut self, p: *const u8, len: usize) -> u64 {
@@ -396,17 +416,8 @@ impl LongPart {
             });
         }
         let _ = used;
-        // Own the bytes so the input mapping can be released later.
-        let total: usize = slots.iter().filter(|s| s.0 != 0).map(|s| (s.1 >> 48) as usize).sum();
-        let mut bytes: Vec<u8> = Vec::with_capacity(total);
-        let base = bytes.as_ptr() as u64;
-        for s in slots.iter_mut().filter(|s| s.0 != 0) {
-            let b = unsafe { span(s.1) };
-            let off = bytes.len() as u64;
-            bytes.extend_from_slice(b);
-            s.1 = (base + off) | ((b.len() as u64) << 48);
-        }
-        debug_assert_eq!(bytes.as_ptr() as u64, base);
+        // Slots point at the input, which stays mapped until the output is written.
+        let bytes = Vec::new();
         (LongPart { slots, bytes }, ok)
     }
 
